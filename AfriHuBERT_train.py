@@ -276,7 +276,7 @@ def main():
     dataset = dataset.map(
         prepare_example,
         remove_columns=dataset["train"].column_names,
-        num_proc=1,
+        num_proc=4,
     )
 
     print(f"Train examples: {len(dataset['train'])} | Eval examples: {len(dataset['validation'])}")
