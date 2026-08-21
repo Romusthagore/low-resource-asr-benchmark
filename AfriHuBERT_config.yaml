@@ -1,0 +1,52 @@
+# AfriHuBERT fine-tuning config -- mirrors config.yaml (Whisper) and the
+# w2v-BERT-2.0 baseline: same dataset, same ~15h volume, same epochs, so
+# results are directly comparable across all three models.
+#
+# Usage:
+#   python train_afrihubert.py --config config_afrihubert.yaml
+
+# --- Data ---
+dataset_name: "DDD-Kenya/Luhya-ASR-Data-subset-50h"
+train_split: "train"
+eval_split: "validation"
+text_column: "transcript"
+audio_column: "audio"
+
+# --- Volume matching ---
+sample: true
+sample_size: 3600
+validation_split_pct: 0.2
+seed: 42
+
+# --- Model ---
+model_name: "ajesujoba/AfriHuBERT"
+language: "luhya"
+freeze_feature_encoder: true
+
+# --- Output ---
+output_dir: "/content/afrihubert-luhya"
+sync_to_drive: "/content/drive/MyDrive/own_whisper/afrihubert-luhya"
+
+# --- Training hyperparameters (same as the w2v-BERT-2.0 baseline) ---
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 4
+gradient_accumulation_steps: 8
+learning_rate: 0.00005
+warmup_steps: 500
+num_train_epochs: 2
+max_steps: -1
+
+# --- Evaluation / checkpointing ---
+eval_steps: 50
+save_steps: 50
+logging_steps: 10
+save_total_limit: 2
+early_stopping_patience: 3
+
+# --- Optimization ---
+group_by_length: true
+gradient_checkpointing: true
+fp16: true
+max_audio_length: 30.0
+
+push_to_hub: false
