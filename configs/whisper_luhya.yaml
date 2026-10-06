@@ -1,0 +1,60 @@
+# Whisper-small fine-tuning configuration.
+#
+# This configuration mirrors the working Whisper reference implementation
+# used for the Luhya ASR experiment.
+#
+# Usage:
+#   python -m african_asr.finetuning.whisper_train \
+#       --config configs/whisper_luhya.yaml
+#
+# Command-line arguments override values defined here.
+
+# --- Data ---
+dataset_name: "DDD-Kenya/Luhya-ASR-Data-subset-50h"
+dataset_config: null
+train_split: "train"
+eval_split: "validation"
+text_column: "transcript"
+audio_column: "audio"
+
+# --- Sampling ---
+# The reference experiment samples 3,600 training examples.
+# The actual audio duration must be measured after sampling.
+sample: true
+sample_size: 3600
+validation_split_pct: 0.2
+seed: 42
+
+# --- Model ---
+model_name: "openai/whisper-small"
+language: "luhya"
+task: "transcribe"
+
+# --- Output ---
+output_dir: "./outputs/whisper-small-luhya"
+
+# --- Training hyperparameters ---
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 4
+gradient_accumulation_steps: 8
+learning_rate: 0.00005
+warmup_steps: 500
+num_train_epochs: 2
+max_steps: -1
+
+# --- Evaluation / checkpointing ---
+eval_steps: 50
+save_steps: 50
+logging_steps: 10
+save_total_limit: 2
+early_stopping_patience: 3
+
+# --- Optimization ---
+group_by_length: true
+gradient_checkpointing: true
+fp16: true
+max_audio_length: 30.0
+
+# --- Hub ---
+push_to_hub: false
+hub_model_id: null

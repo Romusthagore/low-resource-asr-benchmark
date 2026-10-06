@@ -1,132 +1,170 @@
 """Dataset loading utilities for the African ASR benchmark."""
 
-from datasets import Dataset, DatasetDict, load_dataset
-
-
-AUDIO_COLUMN_CANDIDATES = [
-    "audio",
-    "Audio",
-    "audio_filepath",
-    "audio_file",
-    "audio_path",
-    "wav",
-    "wav_file",
-    "path",
-]
-
-TEXT_COLUMN_CANDIDATES = [
-    "text",
-    "texts",
-    "Text",
-    "sentence",
-    "transcription",
-    "transcript",
-    "transcripts",
-    "transcription_text",
-    "utterance",
-    "normalized_text",
-]
+from datasets import Audio, DatasetDict, load_dataset
 
 
 def load_asr_dataset(
-    dataset_name: str,
-    config_name: str | None = None,
-    split: str | None = None,
-) -> DatasetDict:
-    """Load an ASR dataset from the Hugging Face Hub."""
+    train_csv=None,
+    eval_csv=None,
+    dataset_name="DDD-Kenya/Luhya-ASR-Data-subset-50h",
+    dataset_config=None,
+    train_split="train",
+    eval_split="validation",
+    text_column="transcript",
+    audio_column="audio",
+    sample=True,
+    sample_size=3600,
+    validation_split_pct=0.2,
+    seed=42,
+):
+    """
+    Load and prepare an ASR dataset.
 
-    if config_name is not None:
-        dataset = load_dataset(
-            dataset_name,
-            config_name,
-            split=split,
+    This function mirrors the data-loading behavior of the reference
+    Whisper fine-tuning pipeline.
+
+    Returns:
+        DatasetDict with:
+            - "train"
+            - "validation"
+
+    Notes:
+        - Audio is cast to 16 kHz.
+        - The transcript column is standardized to "sentence".
+        - Sampling is performed before audio preprocessing.
+        - Audio duration is NOT computed here.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Local CSV input
+    # ------------------------------------------------------------------
+    if train_csv:
+        data_files = {"train": train_csv}
+
+        if eval_csv:
+            data_files["validation"] = eval_csv
+
+        ds = load_dataset(
+            "csv",
+            data_files=data_files,
         )
-    else:
-        dataset = load_dataset(
-            dataset_name,
-            split=split,
+
+        if audio_column != "audio":
+            ds = ds.rename_column(
+                audio_column,
+                "audio",
+            )
+
+        if text_column != "sentence":
+            ds = ds.rename_column(
+                text_column,
+                "sentence",
+            )
+
+        ds = ds.cast_column(
+            "audio",
+            Audio(sampling_rate=16000),
         )
 
-    if isinstance(dataset, DatasetDict):
-        return dataset
+        if "validation" not in ds:
+            split = ds["train"].train_test_split(
+                test_size=validation_split_pct,
+                seed=seed,
+            )
 
-    split_name = split or "train"
+            ds = DatasetDict(
+                train=split["train"],
+                validation=split["test"],
+            )
 
-    return DatasetDict({split_name: dataset})
+        return ds
 
+    # ------------------------------------------------------------------
+    # 2. Hugging Face dataset
+    # ------------------------------------------------------------------
+    if dataset_name:
+        ds_all = load_dataset(
+            dataset_name,
+            dataset_config,
+        )
 
-def find_column(
-    dataset: Dataset | DatasetDict,
-    candidates: list[str],
-) -> str:
-    """Find the first matching column from a list of candidates."""
+        if eval_split in ds_all:
+            train_raw = ds_all[train_split]
+            eval_raw = ds_all[eval_split]
 
-    if isinstance(dataset, Dataset):
-        columns = dataset.column_names
-    else:
-        columns = dataset[next(iter(dataset))].column_names
+        else:
+            split = ds_all[train_split].train_test_split(
+                test_size=validation_split_pct,
+                seed=seed,
+            )
 
-    for candidate in candidates:
-        if candidate in columns:
-            return candidate
+            train_raw = split["train"]
+            eval_raw = split["test"]
+
+        # --------------------------------------------------------------
+        # Sampling
+        # --------------------------------------------------------------
+        if sample:
+            train_raw = train_raw.shuffle(
+                seed=seed
+            ).select(
+                range(
+                    min(
+                        sample_size,
+                        len(train_raw),
+                    )
+                )
+            )
+
+            eval_n = max(
+                1,
+                int(
+                    sample_size * validation_split_pct
+                ),
+            )
+
+            eval_raw = eval_raw.shuffle(
+                seed=seed
+            ).select(
+                range(
+                    min(
+                        eval_n,
+                        len(eval_raw),
+                    )
+                )
+            )
+
+        ds = DatasetDict(
+            train=train_raw,
+            validation=eval_raw,
+        )
+
+        # --------------------------------------------------------------
+        # Standardize column names
+        # --------------------------------------------------------------
+        if audio_column != "audio":
+            ds = ds.rename_column(
+                audio_column,
+                "audio",
+            )
+
+        if text_column != "sentence":
+            ds = ds.rename_column(
+                text_column,
+                "sentence",
+            )
+
+        # --------------------------------------------------------------
+        # Standardize audio sampling rate
+        # --------------------------------------------------------------
+        ds = ds.cast_column(
+            "audio",
+            Audio(sampling_rate=16000),
+        )
+
+        return ds
 
     raise ValueError(
-        f"Could not find a matching column.\n"
-        f"Candidates: {candidates}\n"
-        f"Available columns: {columns}"
+        "Provide either --train_csv (+ optional --eval_csv) "
+        "or --dataset_name."
     )
-
-
-def detect_asr_columns(
-    dataset: Dataset | DatasetDict,
-) -> tuple[str, str]:
-    """Automatically detect audio and transcription columns."""
-
-    audio_column = find_column(
-        dataset,
-        AUDIO_COLUMN_CANDIDATES,
-    )
-
-    text_column = find_column(
-        dataset,
-        TEXT_COLUMN_CANDIDATES,
-    )
-
-    return audio_column, text_column
-
-
-def standardize_columns(
-    dataset: Dataset | DatasetDict,
-) -> Dataset | DatasetDict:
-    """Standardize ASR column names to ``audio`` and ``text``."""
-
-    audio_column, text_column = detect_asr_columns(dataset)
-
-    rename_map = {}
-
-    if audio_column != "audio":
-        rename_map[audio_column] = "audio"
-
-    if text_column != "text":
-        rename_map[text_column] = "text"
-
-    if rename_map:
-        dataset = dataset.rename_columns(rename_map)
-
-    return dataset
-
-
-def load_and_standardize_asr_dataset(
-    dataset_name: str,
-    config_name: str | None = None,
-    split: str | None = None,
-) -> DatasetDict:
-    """Load an ASR dataset and standardize its columns."""
-
-    dataset = load_asr_dataset(
-        dataset_name=dataset_name,
-        config_name=config_name,
-        split=split,
-    )
-
-    return standardize_columns(dataset)
