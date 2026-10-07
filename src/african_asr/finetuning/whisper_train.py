@@ -27,8 +27,6 @@ from transformers import (
     EarlyStoppingCallback,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
-    WhisperForConditionalGeneration,
-    WhisperProcessor,
 )
 from transformers.models.whisper.tokenization_whisper import (
     LANGUAGES,
@@ -36,6 +34,8 @@ from transformers.models.whisper.tokenization_whisper import (
 )
 
 from african_asr.data.loaders import load_asr_dataset
+from african_asr.models.whisper import load_whisper
+from african_asr.utils.compute import ComputeTracker
 
 
 def load_config_and_merge(args, cli_supplied: set) -> argparse.Namespace:
@@ -59,6 +59,9 @@ def load_config_and_merge(args, cli_supplied: set) -> argparse.Namespace:
         "model_name": "model_name",
         "language": "language",
         "task": "task",
+        "torch_dtype": "torch_dtype",
+        "low_cpu_mem_usage": "low_cpu_mem_usage",
+        "use_safetensors": "use_safetensors",
         "output_dir": "output_dir",
         "per_device_train_batch_size": "per_device_train_batch_size",
         "per_device_eval_batch_size": "per_device_eval_batch_size",
@@ -114,11 +117,11 @@ def add_arguments(p):
 
     p.add_argument("--train_split", type=str, default="train")
     p.add_argument("--eval_split", type=str, default="validation")
-
     p.add_argument("--text_column", type=str, default="transcript")
     p.add_argument("--audio_column", type=str, default="audio")
 
     p.add_argument("--sample", action="store_true", default=True)
+
     p.add_argument(
         "--no_sample",
         dest="sample",
@@ -148,6 +151,37 @@ def add_arguments(p):
         type=str,
         default="transcribe",
         choices=["transcribe", "translate"],
+    )
+
+    p.add_argument(
+        "--torch_dtype",
+        type=str,
+        default=None,
+        choices=["float16", "float32"],
+    )
+
+    p.add_argument(
+        "--low_cpu_mem_usage",
+        action="store_true",
+        default=True,
+    )
+
+    p.add_argument(
+        "--no_low_cpu_mem_usage",
+        dest="low_cpu_mem_usage",
+        action="store_false",
+    )
+
+    p.add_argument(
+        "--use_safetensors",
+        action="store_true",
+        default=True,
+    )
+
+    p.add_argument(
+        "--no_use_safetensors",
+        dest="use_safetensors",
+        action="store_false",
     )
 
     p.add_argument(
@@ -331,6 +365,17 @@ def main():
         args.language
     )
 
+    # --------------------------------------------------------------
+    # Whisper model and processor
+    # --------------------------------------------------------------
+
+    model, processor, device = load_whisper(
+        model_name=args.model_name,
+        torch_dtype=args.torch_dtype,
+        low_cpu_mem_usage=args.low_cpu_mem_usage,
+        use_safetensors=args.use_safetensors,
+    )
+
     processor_kwargs = {
         "task": args.task,
     }
@@ -338,20 +383,17 @@ def main():
     if whisper_language is not None:
         processor_kwargs["language"] = whisper_language
 
-    processor = WhisperProcessor.from_pretrained(
+    # The model loader provides the processor. Re-create it with the
+    # same language/task settings used by the validated reference pipeline.
+    processor = type(processor).from_pretrained(
         args.model_name,
         **processor_kwargs,
     )
 
-    model = WhisperForConditionalGeneration.from_pretrained(
-        args.model_name
-    )
-
     if whisper_language is not None:
         model.generation_config.language = whisper_language
-
-    model.generation_config.task = args.task
-    model.generation_config.forced_decoder_ids = None
+        model.generation_config.task = args.task
+        model.generation_config.forced_decoder_ids = None
 
     # --------------------------------------------------------------
     # Dataset
@@ -423,10 +465,8 @@ def main():
     # Data collator
     # --------------------------------------------------------------
 
-    data_collator = (
-        DataCollatorSpeechSeq2SeqWithPadding(
-            processor=processor
-        )
+    data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+        processor=processor
     )
 
     # --------------------------------------------------------------
@@ -585,10 +625,29 @@ def main():
     )
 
     # --------------------------------------------------------------
-    # Train
+    # Train + compute measurement
     # --------------------------------------------------------------
 
+    compute_tracker = ComputeTracker()
+    compute_tracker.start()
+
     trainer.train()
+
+    compute_results = compute_tracker.stop()
+
+    compute_tracker.save(
+        compute_results,
+        f"{args.output_dir}/compute.json",
+    )
+
+    print("Compute results:")
+
+    for key, value in compute_results.items():
+        print(f"{key}: {value}")
+
+    # --------------------------------------------------------------
+    # Save model
+    # --------------------------------------------------------------
 
     trainer.save_model(
         args.output_dir

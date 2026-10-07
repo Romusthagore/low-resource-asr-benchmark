@@ -30,6 +30,11 @@ model_name: "openai/whisper-small"
 language: "luhya"
 task: "transcribe"
 
+# --- Model loading ---
+torch_dtype: "float16"
+low_cpu_mem_usage: true
+use_safetensors: true
+
 # --- Output ---
 output_dir: "./outputs/whisper-small-luhya"
 
