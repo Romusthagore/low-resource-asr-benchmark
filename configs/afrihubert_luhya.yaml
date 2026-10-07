@@ -1,0 +1,62 @@
+# AfriHuBERT downstream ASR configuration.
+#
+# Based on the official AfriHuBERT downstream ASR recipe.
+# The dataset sampling matches the Whisper Luhya experiment.
+#
+# This configuration is temporarily set to 1 epoch for pipeline validation.
+# The final benchmark will restore the official 30-epoch setting.
+
+# --- Data ---
+dataset_name: "DDD-Kenya/Luhya-ASR-Data-subset-50h"
+dataset_config: null
+train_split: "train"
+eval_split: "validation"
+text_column: "transcript"
+audio_column: "audio"
+
+# --- Sampling ---
+sample: true
+sample_size: 3600
+validation_split_pct: 0.2
+seed: 1
+
+# --- Model ---
+model_name: "ajesujoba/AfriHuBERT"
+
+# --- Audio ---
+sample_rate: 16000
+max_audio_length: 30.0
+
+# --- Model architecture ---
+wav2vec_output_dim: 768
+dnn_neurons: 1024
+freeze_wav2vec: false
+
+# --- Tokenization ---
+token_type: "char"
+character_coverage: 1.0
+blank_index: 0
+bos_index: 1
+eos_index: 2
+
+# --- Training ---
+number_of_epochs: 5
+batch_size: 2
+test_batch_size: 2
+grad_accumulation_factor: 8
+
+# --- Optimization ---
+learning_rate: 1.0
+encoder_learning_rate: 0.0001
+
+# --- Precision ---
+precision: "fp32"
+
+# --- DataLoader ---
+num_workers: 2
+
+# --- Compute tracking ---
+track_compute: true
+
+# --- Output ---
+output_dir: "./outputs/afrihubert-luhya"
