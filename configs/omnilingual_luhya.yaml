@@ -1,0 +1,45 @@
+# Omnilingual CTC-300M v2 fine-tuning on Luhya.
+
+model:
+  name: "omniASR_CTC_300M_v2"
+
+dataset:
+  name: "luhya_manifest"
+  train_split: "train"
+  valid_split: "valid"
+  storage_mode: "MANIFEST"
+  task_mode: "ASR"
+
+  manifest_storage_config:
+    read_text: true
+
+  asr_task_config:
+    min_audio_len: 16000
+    max_audio_len: 480000
+    max_num_elements: 1920000
+    batch_shuffle_window: 1
+    normalize_audio: true
+    example_shuffle_window: 1
+
+tokenizer:
+  name: "omniASR_tokenizer_written_v2"
+
+optimizer:
+  config:
+    lr: 1.0e-05
+
+trainer:
+  freeze_encoder_for_n_steps: 0
+
+  mixed_precision:
+    dtype: "torch.bfloat16"
+
+  grad_accumulation:
+    num_batches: 4
+
+regime:
+  num_steps: 5000
+  validate_after_n_steps: 0
+  validate_every_n_steps: 500
+  checkpoint_every_n_steps: 500
+  publish_metrics_every_n_steps: 100

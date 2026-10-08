@@ -1,28 +1,25 @@
-# Whisper-small fine-tuning configuration.
-#
-# This configuration mirrors the working Whisper reference implementation
-# used for the Luhya ASR experiment.
-#
-# Usage:
-#   python -m african_asr.finetuning.whisper_train \
-#       --config configs/whisper_luhya.yaml
-#
-# Command-line arguments override values defined here.
+# Whisper fine-tuning configuration for Luhya ASR.
 
 # --- Data ---
-dataset_name: "DDD-Kenya/Luhya-ASR-Data-subset-50h"
+dataset_name: "Digital-Divide-Data/Luhya-ASR-Data-subset-642H"
 dataset_config: null
+
+# The dataset provides only a single "train" split.
 train_split: "train"
-eval_split: "validation"
-text_column: "transcript"
+eval_split: null
+test_split: null
+
+text_column: "transcripts"
 audio_column: "audio"
 
-# --- Sampling ---
-# The reference experiment samples 3,600 training examples.
-# The actual audio duration must be measured after sampling.
+# --- Sampling / splitting ---
 sample: true
-sample_size: 3600
+sample_size: 15000
+num_proc: 4
+
 validation_split_pct: 0.2
+test_split_pct: 0.1
+
 seed: 42
 
 # --- Model ---
@@ -42,8 +39,10 @@ output_dir: "./outputs/whisper-small-luhya"
 per_device_train_batch_size: 4
 per_device_eval_batch_size: 4
 gradient_accumulation_steps: 8
+
 learning_rate: 0.00005
 warmup_steps: 500
+
 num_train_epochs: 2
 max_steps: -1
 
@@ -51,6 +50,7 @@ max_steps: -1
 eval_steps: 50
 save_steps: 50
 logging_steps: 10
+
 save_total_limit: 2
 early_stopping_patience: 3
 

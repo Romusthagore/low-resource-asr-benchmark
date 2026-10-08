@@ -54,7 +54,9 @@ def load_config_and_merge(args, cli_supplied: set) -> argparse.Namespace:
         "audio_column": "audio_column",
         "sample": "sample",
         "sample_size": "sample_size",
+        "num_proc": "num_proc",
         "validation_split_pct": "validation_split_pct",
+        "test_split_pct": "test_split_pct",
         "seed": "seed",
         "model_name": "model_name",
         "language": "language",
@@ -129,8 +131,20 @@ def add_arguments(p):
         help="Disable sampling and use the full dataset split.",
     )
 
-    p.add_argument("--sample_size", type=int, default=3600)
+    p.add_argument(
+    "--sample_size",
+    type=int,
+    default=None,
+    help="Number of training examples to sample. Set in the YAML config.",
+)
+    p.add_argument(
+        "--num_proc",
+        type=int,
+        default=None,
+        help="Number of processes used for dataset preprocessing. Set in the YAML config.",
+    )
     p.add_argument("--validation_split_pct", type=float, default=0.2)
+    p.add_argument("--test_split_pct", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=42)
 
     p.add_argument(
@@ -411,6 +425,7 @@ def main():
         sample=args.sample,
         sample_size=args.sample_size,
         validation_split_pct=args.validation_split_pct,
+        test_split_pct=args.test_split_pct,
         seed=args.seed,
     )
 
@@ -444,7 +459,7 @@ def main():
             for c in dataset["train"].column_names
             if c not in ("audio_duration",)
         ],
-        num_proc=1,
+        num_proc=args.num_proc,
     )
 
     dataset = dataset.filter(
