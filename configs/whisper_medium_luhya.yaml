@@ -35,7 +35,7 @@ test_split_pct: 0.1
 seed: 42
 
 # --- Model ---
-model_name: "openai/whisper-small"
+model_name: "openai/whisper-medium"
 
 # Luhya is not natively supported by Whisper.
 # The training code handles this without forcing an unsupported language token.
@@ -50,7 +50,7 @@ low_cpu_mem_usage: true
 use_safetensors: true
 
 # --- Output ---
-output_dir: "/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/whisper-small-luhya"
+output_dir: "/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/whisper-medium-luhya"
 
 # --- Training hyperparameters ---
 # Same effective batch size as the previously validated baseline:

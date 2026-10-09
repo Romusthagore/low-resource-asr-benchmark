@@ -19,8 +19,10 @@ def load_whisper(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Keep model parameters in FP32 when using Trainer(fp16=True).
+    # Trainer/autocast handles mixed-precision training.
     if torch_dtype is None:
-        dtype = torch.float16 if device == "cuda" else torch.float32
+        dtype = torch.float32
     elif torch_dtype == "float16":
         dtype = torch.float16
     elif torch_dtype == "float32":
@@ -40,5 +42,10 @@ def load_whisper(
     processor = AutoProcessor.from_pretrained(model_name)
 
     model.to(device)
+
+    # Ensure FP32 parameters when dtype is configured as float32.
+    # This prevents GradScaler from encountering FP16 parameter gradients.
+    if dtype == torch.float32:
+        model.float()
 
     return model, processor, device

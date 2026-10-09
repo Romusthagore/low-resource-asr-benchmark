@@ -56,6 +56,7 @@ def load_config_and_merge(args, cli_supplied: set) -> argparse.Namespace:
         "sample_size": "sample_size",
         "num_proc": "num_proc",
         "validation_split_pct": "validation_split_pct",
+        "max_eval_samples": "max_eval_samples",
         "test_split_pct": "test_split_pct",
         "seed": "seed",
         "model_name": "model_name",
@@ -144,6 +145,7 @@ def add_arguments(p):
         help="Number of processes used for dataset preprocessing. Set in the YAML config.",
     )
     p.add_argument("--validation_split_pct", type=float, default=0.2)
+    p.add_argument("--max_eval_samples", type=int, default=1000)
     p.add_argument("--test_split_pct", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=42)
 
@@ -406,8 +408,9 @@ def main():
 
     if whisper_language is not None:
         model.generation_config.language = whisper_language
-        model.generation_config.task = args.task
-        model.generation_config.forced_decoder_ids = None
+
+    model.generation_config.task = args.task
+    model.generation_config.forced_decoder_ids = None
 
     # --------------------------------------------------------------
     # Dataset
@@ -452,14 +455,20 @@ def main():
 
         return batch
 
-    dataset = dataset.map(
-        prepare_example,
-        remove_columns=[
+    map_kwargs = {
+        "remove_columns": [
             c
             for c in dataset["train"].column_names
             if c not in ("audio_duration",)
         ],
-        num_proc=args.num_proc,
+    }
+
+    if args.num_proc is not None:
+        map_kwargs["num_proc"] = args.num_proc
+
+    dataset = dataset.map(
+        prepare_example,
+        **map_kwargs,
     )
 
     dataset = dataset.filter(
@@ -470,6 +479,13 @@ def main():
     dataset = dataset.remove_columns(
         ["audio_duration"]
     )
+
+    # Use a fixed, reproducible subset for fast evaluation during training.
+    eval_limit = args.max_eval_samples
+    if eval_limit > 0 and len(dataset["validation"]) > eval_limit:
+        dataset["validation"] = dataset["validation"].shuffle(
+            seed=args.seed
+        ).select(range(eval_limit))
 
     print(
         f"Train examples: {len(dataset['train'])} | "
@@ -485,18 +501,20 @@ def main():
     )
 
     # --------------------------------------------------------------
-    # WER
+    # --------------------------------------------------------------
+    # WER and CER
     # --------------------------------------------------------------
 
     wer_metric = evaluate.load("wer")
+    cer_metric = evaluate.load("cer")
 
     def compute_metrics(pred):
         pred_ids = pred.predictions
         label_ids = pred.label_ids
 
-        label_ids[
-            label_ids == -100
-        ] = processor.tokenizer.pad_token_id
+        # Replace ignored label positions before decoding.
+        label_ids = label_ids.copy()
+        label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
         pred_str = processor.tokenizer.batch_decode(
             pred_ids,
@@ -516,7 +534,15 @@ def main():
             )
         )
 
-        return {"wer": wer}
+        cer = (
+            100
+            * cer_metric.compute(
+                predictions=pred_str,
+                references=label_str,
+            )
+        )
+
+        return {"wer": wer, "cer": cer}
 
     # --------------------------------------------------------------
     # Training arguments
@@ -569,24 +595,61 @@ def main():
         ).parameters
     )
 
-    dropped = [
-        k
-        for k in training_args_kwargs
-        if k not in accepted
-    ]
+    # Compatibilité entre versions de Transformers.
+    if "eval_strategy" not in accepted:
+        if "evaluation_strategy" in accepted:
+            training_args_kwargs["evaluation_strategy"] = (
+                training_args_kwargs.pop("eval_strategy")
+            )
+            strategy_key = "evaluation_strategy"
+        else:
+            raise RuntimeError(
+                "Cette version de Transformers ne prend en charge "
+                "ni eval_strategy ni evaluation_strategy."
+            )
+    else:
+        strategy_key = "eval_strategy"
 
-    if dropped:
-        warnings.warn(
-            "Seq2SeqTrainingArguments in your installed "
-            "transformers version doesn't accept: "
-            f"{dropped}. Dropping them and continuing.",
-            stacklevel=2,
+    # Vérifier que l'évaluation et la sélection du meilleur modèle
+    # sont bien configurables.
+    required_keys = {
+        strategy_key,
+        "eval_steps",
+        "save_steps",
+        "load_best_model_at_end",
+        "metric_for_best_model",
+        "predict_with_generate",
+    }
+
+    missing_api = required_keys - accepted
+    if missing_api:
+        raise RuntimeError(
+            "Arguments indispensables non pris en charge par "
+            f"cette version de Transformers : {sorted(missing_api)}"
         )
 
+    missing_kwargs = required_keys - set(training_args_kwargs)
+    if missing_kwargs:
+        raise RuntimeError(
+            "Arguments indispensables manquants : "
+            f"{sorted(missing_kwargs)}"
+        )
+
+    # Ne pas ignorer silencieusement les arguments non pris en charge.
+    unsupported = sorted(
+        key for key in training_args_kwargs
+        if key not in accepted
+    )
+    if unsupported:
+        warnings.warn(
+            "Arguments non pris en charge par cette version "
+            f"de Transformers : {unsupported}",
+            UserWarning,
+        )
         training_args_kwargs = {
-            k: v
-            for k, v in training_args_kwargs.items()
-            if k in accepted
+            key: value
+            for key, value in training_args_kwargs.items()
+            if key in accepted
         }
 
     training_args = Seq2SeqTrainingArguments(
@@ -604,7 +667,7 @@ def main():
         eval_dataset=dataset["validation"],
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        processing_class=processor.feature_extractor,
+        processing_class=processor,
     )
 
     trainer_accepted = set(
@@ -659,6 +722,7 @@ def main():
 
     for key, value in compute_results.items():
         print(f"{key}: {value}")
+
 
     # --------------------------------------------------------------
     # Save model
