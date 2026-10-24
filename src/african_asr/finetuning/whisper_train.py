@@ -54,6 +54,7 @@ def load_config_and_merge(args, cli_supplied: set) -> argparse.Namespace:
         "audio_column": "audio_column",
         "sample": "sample",
         "sample_size": "sample_size",
+        "target_train_hours": "target_train_hours",
         "num_proc": "num_proc",
         "validation_split_pct": "validation_split_pct",
         "max_eval_samples": "max_eval_samples",
@@ -138,6 +139,12 @@ def add_arguments(p):
     default=None,
     help="Number of training examples to sample. Set in the YAML config.",
 )
+    p.add_argument(
+        "--target_train_hours",
+        type=float,
+        default=None,
+        help="Target training duration in hours.",
+    )
     p.add_argument(
         "--num_proc",
         type=int,
@@ -373,6 +380,32 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 def main():
     args = parse_args()
 
+    # Automatically set output directory based on training hours and seed.
+    if args.target_train_hours is not None:
+        import re
+        from pathlib import Path
+
+        hours = f"{args.target_train_hours:g}"
+        base_output_dir = Path(args.output_dir)
+
+        new_name = re.sub(
+            r"_\d+(?:\.\d+)?h_seed\d+$",
+            f"_{hours}h_seed{args.seed}",
+            base_output_dir.name,
+        )
+
+        if new_name == base_output_dir.name and not re.search(
+            r"_\d+(?:\.\d+)?h_seed\d+$",
+            base_output_dir.name,
+        ):
+            raise ValueError(
+                "output_dir must end with '_<hours>h_seed<seed>'"
+            )
+
+        args.output_dir = str(base_output_dir.with_name(new_name))
+
+    print(f"Fine-tuned model output: {args.output_dir}", flush=True)
+
     # --------------------------------------------------------------
     # Whisper language
     # --------------------------------------------------------------
@@ -427,6 +460,7 @@ def main():
         audio_column=args.audio_column,
         sample=args.sample,
         sample_size=args.sample_size,
+        target_train_hours=args.target_train_hours,
         validation_split_pct=args.validation_split_pct,
         test_split_pct=args.test_split_pct,
         seed=args.seed,
@@ -434,65 +468,103 @@ def main():
 
     # --------------------------------------------------------------
     # Whisper preprocessing
-    # --------------------------------------------------------------
 
+    dataset = {
+        "train": dataset["train"],
+        "validation": dataset["validation"],
+    }
+
+    # Preserve the current validation selection protocol.
+    eval_limit = args.max_eval_samples
+    if eval_limit > 0 and len(dataset["validation"]) > eval_limit:
+        dataset["validation"] = (
+            dataset["validation"]
+            .shuffle(seed=args.seed, keep_in_memory=True)
+            .select(range(eval_limit), keep_in_memory=True)
+        )
+
+    # Store intermediate Dataset transformations on node-local storage.
+    import os
+
+    job_id = os.environ.get("SLURM_JOB_ID", "local")
+    map_cache_dir = os.path.join(
+        os.environ.get("SLURM_TMPDIR", "/tmp"),
+        f"whisper-medium-map-cache-{job_id}",
+    )
+    os.makedirs(map_cache_dir, exist_ok=True)
+    print(f"Dataset intermediate cache: {map_cache_dir}", flush=True)
+
+    # Filter long audios BEFORE extracting Whisper features.
+    def add_audio_duration(batch):
+        audio = batch["audio"]
+        batch["audio_duration"] = (
+            len(audio["array"]) / audio["sampling_rate"]
+        )
+        return batch
+
+    duration_kwargs = {}
+    if args.num_proc is not None:
+        duration_kwargs["num_proc"] = args.num_proc
+
+    for split_name in ("train", "validation"):
+        dataset[split_name] = dataset[split_name].map(
+            add_audio_duration,
+            cache_file_name=os.path.join(
+                map_cache_dir, f"{split_name}_duration.arrow"
+            ),
+            load_from_cache_file=False,
+            **duration_kwargs,
+        )
+        dataset[split_name] = dataset[split_name].filter(
+            lambda row: row["audio_duration"] <= args.max_audio_length,
+            cache_file_name=os.path.join(
+                map_cache_dir, f"{split_name}_filtered.arrow"
+            ),
+            load_from_cache_file=False,
+        )
+
+    # Extract features only for examples that passed the duration filter.
     def prepare_example(batch):
         audio = batch["audio"]
-
         batch["input_features"] = processor.feature_extractor(
             audio["array"],
             sampling_rate=audio["sampling_rate"],
         ).input_features[0]
-
         batch["labels"] = processor.tokenizer(
             batch["sentence"]
         ).input_ids
-
-        batch["audio_duration"] = (
-            len(audio["array"])
-            / audio["sampling_rate"]
-        )
-
         return batch
 
-    map_kwargs = {
-        "remove_columns": [
-            c
-            for c in dataset["train"].column_names
-            if c not in ("audio_duration",)
-        ],
-    }
+    for split_name in ("train", "validation"):
+        columns_to_remove = [
+            column
+            for column in dataset[split_name].column_names
+            if column != "audio_duration"
+        ]
 
-    if args.num_proc is not None:
-        map_kwargs["num_proc"] = args.num_proc
+        feature_kwargs = {
+            "remove_columns": columns_to_remove,
+            "cache_file_name": os.path.join(
+                map_cache_dir, f"{split_name}_features.arrow"
+            ),
+            "load_from_cache_file": False,
+        }
+        if args.num_proc is not None:
+            feature_kwargs["num_proc"] = args.num_proc
 
-    dataset = dataset.map(
-        prepare_example,
-        **map_kwargs,
-    )
-
-    dataset = dataset.filter(
-        lambda x: x["audio_duration"]
-        <= args.max_audio_length
-    )
-
-    dataset = dataset.remove_columns(
-        ["audio_duration"]
-    )
-
-    # Use a fixed, reproducible subset for fast evaluation during training.
-    eval_limit = args.max_eval_samples
-    if eval_limit > 0 and len(dataset["validation"]) > eval_limit:
-        dataset["validation"] = dataset["validation"].shuffle(
-            seed=args.seed
-        ).select(range(eval_limit))
+        dataset[split_name] = dataset[split_name].map(
+            prepare_example,
+            **feature_kwargs,
+        )
+        dataset[split_name] = dataset[split_name].remove_columns(
+            ["audio_duration"]
+        )
 
     print(
-        f"Train examples: {len(dataset['train'])} | "
-        f"Eval examples: {len(dataset['validation'])}"
+        f"Train examples after filtering: {len(dataset['train'])} | "
+        f"Validation examples after filtering: {len(dataset['validation'])}"
     )
 
-    # --------------------------------------------------------------
     # Data collator
     # --------------------------------------------------------------
 
@@ -505,8 +577,19 @@ def main():
     # WER and CER
     # --------------------------------------------------------------
 
-    wer_metric = evaluate.load("wer")
-    cer_metric = evaluate.load("cer")
+    # Store evaluation metric temporary files on node-local storage.
+    import os
+
+    job_id = os.environ.get("SLURM_JOB_ID", "local")
+    metrics_cache_dir = os.path.join(
+        os.environ.get("SLURM_TMPDIR", "/tmp"),
+        f"whisper-medium-metrics-{job_id}",
+    )
+    os.makedirs(metrics_cache_dir, exist_ok=True)
+    print(f"Evaluation metrics cache: {metrics_cache_dir}", flush=True)
+
+    wer_metric = evaluate.load("wer", cache_dir=metrics_cache_dir, experiment_id=job_id)
+    cer_metric = evaluate.load("cer", cache_dir=metrics_cache_dir, experiment_id=job_id)
 
     def compute_metrics(pred):
         pred_ids = pred.predictions
@@ -562,6 +645,7 @@ def main():
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
         gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         fp16=args.fp16,
         group_by_length=args.group_by_length,
         eval_strategy="steps",

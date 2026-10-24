@@ -1,4 +1,4 @@
-# Whisper-small fine-tuning configuration for the Luhya ASR benchmark.
+# whisper-small fine-tuning configuration for the Luhya ASR benchmark.
 #
 # Protocol:
 # - Dataset: Digital-Divide-Data/Luhya-ASR-Data-subset-642H
@@ -21,24 +21,22 @@ text_column: "transcripts"
 audio_column: "audio"
 
 # --- Sampling / splitting ---
+target_train_hours: 50
 sample: true
-sample_size: 15000
+sample_size: null
 
 # Use single-process preprocessing.
 # Multiprocessing caused Dataset.map to hang on the Mila environment.
 num_proc: null
-
-validation_split_pct: 0.2
+validation_split_pct: 0.1
 max_eval_samples: 1000
 test_split_pct: 0.1
-
 seed: 42
 
 # --- Model ---
 model_name: "openai/whisper-small"
 
 # Luhya is not natively supported by Whisper.
-# The training code handles this without forcing an unsupported language token.
 language: "luhya"
 task: "transcribe"
 
@@ -50,11 +48,10 @@ low_cpu_mem_usage: true
 use_safetensors: true
 
 # --- Output ---
-output_dir: "/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/whisper-small-luhya"
+output_dir: "/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/whisper-small_luhya_642h_50h_seed42/final_model"
 
 # --- Training hyperparameters ---
 # Same effective batch size as the previously validated baseline:
-# 4 x 8 = 32
 per_device_train_batch_size: 4
 per_device_eval_batch_size: 8
 gradient_accumulation_steps: 8
@@ -62,13 +59,12 @@ gradient_accumulation_steps: 8
 learning_rate: 0.00005
 warmup_steps: 500
 
-# Same number of epochs as the previously validated baseline.
-num_train_epochs: 4
+num_train_epochs: 10
 max_steps: -1
 
 # --- Evaluation / checkpointing ---
-eval_steps: 500
-save_steps: 500
+eval_steps: 200
+save_steps: 200
 logging_steps: 10
 
 save_total_limit: 2

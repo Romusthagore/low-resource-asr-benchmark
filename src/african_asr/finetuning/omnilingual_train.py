@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import subprocess
 import sys
@@ -16,8 +17,8 @@ from african_asr.data.loaders import load_asr_dataset
 
 
 DEFAULT_CONFIG = "configs/omnilingual_luhya.yaml"
-DEFAULT_WORK_DIR = "./outputs/omnilingual-ctc-300m-luhya"
-DEFAULT_DATASET = "DDD-Kenya/Luhya-ASR-Data-subset-50h"
+DEFAULT_WORK_DIR = "/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/omnilingual-ctc-1b-luhya"
+DEFAULT_DATASET = None
 DEFAULT_SAMPLING_RATE = 16000
 DEFAULT_MAX_AUDIO_LENGTH = 30.0
 OMNILINGUAL_ROOT = Path.home() / "omnilingual-asr"
@@ -154,6 +155,9 @@ def build_recipe_config(
     with source_config.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    # Keep preparation-only settings out of the Fairseq2 recipe config.
+    config.pop("data_preparation", None)
+
     if "dataset" not in config:
         raise ValueError(
             "The Omnilingual configuration must contain a 'dataset' section."
@@ -230,18 +234,45 @@ def main():
         exist_ok=True,
     )
 
-    print("Loading Luhya benchmark dataset...")
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    prep = config.get("data_preparation", {})
 
-    datasets = load_asr_dataset(
-        dataset_name=args.dataset_name,
-        train_split="train",
-        eval_split="validation",
-        test_split="test",
-        sample=True,
-        sample_size=3600,
-        validation_split_pct=0.2,
-        seed=42,
-    )
+    dataset_name = args.dataset_name or prep.get("dataset_name")
+    if not dataset_name:
+        raise ValueError(
+            "Missing dataset_name in YAML data_preparation."
+        )
+
+    # Pass YAML preparation parameters supported by the dataset loader.
+    loader_parameters = inspect.signature(load_asr_dataset).parameters
+    loader_kwargs = {
+        key: value
+        for key, value in prep.items()
+        if key in loader_parameters
+    }
+    loader_kwargs.update({
+        "dataset_name": dataset_name,
+        "train_split": "train",
+        "eval_split": "validation",
+        "test_split": "test",
+    })
+
+    print(f"Loading dataset from YAML: {dataset_name}")
+    print(f"Dataset preparation settings: {prep}")
+
+    datasets = load_asr_dataset(**loader_kwargs)
+
+    # Limit validation deterministically; keep the test split untouched.
+    max_eval_samples = prep.get("max_eval_samples")
+    if max_eval_samples is not None:
+        max_eval_samples = int(max_eval_samples)
+        if max_eval_samples < 1:
+            raise ValueError("max_eval_samples must be >= 1.")
+        eval_dataset = datasets["validation"]
+        if len(eval_dataset) > max_eval_samples:
+            datasets["validation"] = eval_dataset.shuffle(
+                seed=int(prep.get("seed", 42))
+            ).select(range(max_eval_samples))
 
     print(
         "Dataset sizes:",

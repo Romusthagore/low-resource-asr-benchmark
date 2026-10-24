@@ -5,7 +5,7 @@ import torch
 from omnilingual_asr.models.inference.pipeline import ASRInferencePipeline
 
 
-DEFAULT_OMNILINGUAL_MODEL = "omniASR_CTC_300M_v2"
+DEFAULT_OMNILINGUAL_MODEL = "omniASR_CTC_1B"
 
 
 def load_omnilingual(

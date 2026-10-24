@@ -30,7 +30,7 @@ class AfriHuBERTCTC(nn.Module):
 
         self.encoder = encoder
 
-        self.linear1 = nn.Linear(768, 1024)
+        self.linear1 = nn.Linear(encoder.config.hidden_size, 1024)
         self.bn1 = nn.BatchNorm1d(1024)
         self.act1 = nn.LeakyReLU()
         self.drop1 = nn.Dropout(0.15)
@@ -394,7 +394,9 @@ def main():
         audio_column=config["audio_column"],
         sample=config["sample"],
         sample_size=config["sample_size"],
+        target_train_hours=config.get("target_train_hours"),
         validation_split_pct=config["validation_split_pct"],
+        test_split_pct=config.get("test_split_pct", 0.1),
         seed=config["seed"],
     )
 
@@ -403,8 +405,16 @@ def main():
         config["max_audio_length"],
     )
 
+    eval_dataset = dataset["validation"]
+    max_eval_samples = config.get("max_eval_samples")
+
+    if max_eval_samples is not None:
+        eval_dataset = eval_dataset.select(
+            range(min(max_eval_samples, len(eval_dataset)))
+        )
+
     eval_examples = prepare_examples(
-        dataset["validation"],
+        eval_dataset,
         config["max_audio_length"],
     )
 
@@ -439,6 +449,31 @@ def main():
         encoder=encoder,
         vocab_size=len(vocabulary),
     ).to(device)
+
+    checkpoint_path = config.get("initial_checkpoint")
+
+    if checkpoint_path is not None:
+        checkpoint_path = Path(checkpoint_path)
+
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Initial checkpoint not found: {checkpoint_path}"
+            )
+
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=device,
+            weights_only=True,
+        )
+
+        model.load_state_dict(checkpoint)
+
+        print(f"Loaded initial checkpoint: {checkpoint_path}")
+    else:
+        print("No initial ASR checkpoint configured.")
+        print(
+            "Using pretrained encoder and a newly initialized ASR head."
+        )
 
     if config["freeze_wav2vec"]:
         for parameter in model.encoder.parameters():
@@ -536,6 +571,13 @@ def main():
                 input_values=input_values,
                 attention_mask=attention_mask,
             )
+
+            if batch_index == 1 or batch_index % 50 == 0:
+                print(
+                    f"Epoch {epoch + 1}/{config['number_of_epochs']} "
+                    f"- batch {batch_index}/{total_batches}",
+                    flush=True,
+                )
 
             log_probs = F.log_softmax(
                 logits,

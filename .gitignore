@@ -219,3 +219,34 @@ __marimo__/
 
 # Training outputs and checkpoints
 outputs/
+
+# Data and generated reports
+*.json
+*.txt
+*.csv
+
+# Logs
+logs/
+slurm-*.out
+slurm-*.err
+*.log
+*.lo
+
+# Backups and temporary files
+*.bak
+*.bak.*
+*.orig
+*.before_*
+__pycache__/
+*.pyc
+/PY
+/cd
+/import
+
+# Large artifacts
+outputs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors

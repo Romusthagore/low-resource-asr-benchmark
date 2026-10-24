@@ -1,0 +1,88 @@
+# whisper-small fine-tuning configuration for the Luhya ASR benchmark.
+#
+# Protocol:
+# - Dataset: Digital-Divide-Data/Luhya-ASR-Data-subset-642H
+# - 15,000 training examples
+# - deterministic seed = 42
+# - 10% held out for test
+# - remaining data split into train/validation
+# - same train/eval/test protocol for all benchmark models
+
+# --- Data ---
+dataset_name: "Digital-Divide-Data/Luhya-ASR-Data-subset-642H"
+dataset_config: null
+
+# Dataset provides only a single "train" split.
+train_split: "train"
+eval_split: null
+test_split: null
+
+text_column: "transcripts"
+audio_column: "audio"
+
+# --- Sampling / splitting ---
+sample: true
+target_train_hours: 50
+sample_size: null
+
+# Use single-process preprocessing.
+# Multiprocessing caused Dataset.map to hang on the Mila environment.
+num_proc: null
+
+validation_split_pct: 0.1
+max_eval_samples: 1000
+test_split_pct: 0.1
+
+seed: 42
+
+# --- Model ---
+model_name: "openai/whisper-large-v3"
+
+# Luhya is not natively supported by Whisper.
+language: "luhya"
+task: "transcribe"
+
+# --- Model loading ---
+# Keep model loading in the default Transformers dtype.
+# Mixed precision is controlled by fp16 during training.
+torch_dtype: null
+low_cpu_mem_usage: true
+use_safetensors: true
+
+# --- Output ---
+output_dir: "/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/whisper-large-v3-luhya_642h_50h_seed42"
+
+# --- Training hyperparameters ---
+# Same effective batch size as the previously validated baseline:
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 8
+gradient_accumulation_steps: 16
+
+learning_rate: 0.00005
+warmup_steps: 500
+
+num_train_epochs: 10
+max_steps: -1
+
+# --- Evaluation / checkpointing ---
+eval_steps: 200
+save_steps: 200
+logging_steps: 10
+
+save_total_limit: 2
+early_stopping_patience: 3
+
+# --- Optimization ---
+group_by_length: true
+gradient_checkpointing: true
+
+# IMPORTANT:
+# Keep fp16 enabled, as in the previously working Whisper-small run.
+# Do NOT set torch_dtype to float16.
+fp16: true
+
+max_audio_length: 30.0
+
+# --- Hub ---
+push_to_hub: false
+hub_model_id: null

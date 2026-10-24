@@ -1,6 +1,132 @@
-"""Dataset loading utilities for the African ASR benchmark."""
+"""Dataset loading and reproducible duration-based splitting utilities."""
 
+import io
+import random
+
+import soundfile as sf
 from datasets import Audio, DatasetDict, load_dataset
+
+
+def _audio_duration_seconds(audio):
+    """Read audio duration from its bytes or accessible file path."""
+    if not isinstance(audio, dict):
+        raise ValueError(f"Expected an audio dictionary, got {type(audio).__name__}")
+
+    data = audio.get("bytes")
+    path = audio.get("path")
+
+    if data is not None:
+        info = sf.info(io.BytesIO(data))
+    elif path:
+        info = sf.info(path)
+    else:
+        raise ValueError("Audio example has neither usable bytes nor a path.")
+
+    if info.samplerate <= 0:
+        raise ValueError(f"Invalid sample rate: {info.samplerate}")
+
+    return info.frames / info.samplerate
+
+
+def _select_by_hours(dataset, target_hours, audio_column="audio", seed=42):
+    """Select a reproducible subset reaching a target duration."""
+    dataset = dataset.cast_column(audio_column, Audio(decode=False))
+    indices = list(range(len(dataset)))
+    random.Random(seed).shuffle(indices)
+
+    chosen = []
+    seconds = 0.0
+    target_seconds = target_hours * 3600
+
+    for idx in indices:
+        audio = dataset[idx][audio_column]
+        seconds += _audio_duration_seconds(audio)
+        chosen.append(idx)
+        if seconds >= target_seconds:
+            break
+
+    if seconds < target_seconds:
+        raise ValueError(
+            f"Dataset contains only {seconds / 3600:.3f} hours; "
+            f"target was {target_hours:.3f} hours."
+        )
+
+    result = dataset.select(chosen)
+    print(
+        f"[ASR data] Selected {len(result)} examples, "
+        f"{seconds / 3600:.3f} h (target: {target_hours:.3f} h)."
+    )
+    return result
+
+
+def _select_splits_by_hours(
+    dataset,
+    audio_column="audio",
+    target_train_hours=50,
+    validation_split_pct=0.1,
+    test_split_pct=0.1,
+    seed=42,
+):
+    """Build disjoint train/validation/test splits by actual audio duration."""
+    val_pct = float(validation_split_pct)
+    test_pct = float(test_split_pct)
+    train_pct = 1.0 - val_pct - test_pct
+
+    if target_train_hours <= 0:
+        raise ValueError("target_train_hours must be positive.")
+    if val_pct < 0 or test_pct < 0 or train_pct <= 0:
+        raise ValueError("Invalid validation/test split percentages.")
+
+    targets = {
+        "train": float(target_train_hours),
+        "validation": float(target_train_hours) * val_pct / train_pct,
+        "test": float(target_train_hours) * test_pct / train_pct,
+    }
+
+    dataset = dataset.cast_column(audio_column, Audio(decode=False))
+    indices = list(range(len(dataset)))
+    random.Random(seed).shuffle(indices)
+
+    selected = {name: [] for name in targets}
+    durations = {name: 0.0 for name in targets}
+    split_names = list(targets)
+    current = 0
+
+    # Read one audio at a time. Never decode the entire column at once.
+    for idx in indices:
+        if current >= len(split_names):
+            break
+
+        name = split_names[current]
+        audio = dataset[idx][audio_column]
+        duration = _audio_duration_seconds(audio)
+
+        selected[name].append(idx)
+        durations[name] += duration
+
+        if durations[name] >= targets[name] * 3600:
+            current += 1
+
+    if current < len(split_names):
+        remaining = split_names[current:]
+        raise ValueError(
+            f"Dataset exhausted before reaching duration targets: {remaining}"
+        )
+
+    result = DatasetDict({
+        name: dataset.select(selected[name])
+        for name in split_names
+    })
+
+    print("\n[ASR data] Duration-based split selection:")
+    for name in split_names:
+        print(
+            f"  {name:10s}: {len(result[name]):6d} examples | "
+            f"{durations[name] / 3600:.3f} h "
+            f"(target: {targets[name]:.3f} h)"
+        )
+
+    return result
 
 
 def load_asr_dataset(
@@ -15,199 +141,105 @@ def load_asr_dataset(
     audio_column="audio",
     sample=True,
     sample_size=None,
-    validation_split_pct=0.2,
+    target_train_hours=None,
+    validation_split_pct=0.1,
     test_split_pct=0.1,
     seed=42,
+    **kwargs,
 ):
-    """
-    Load and prepare an ASR dataset.
+    """Load ASR data and optionally create duration-controlled splits."""
 
-    For datasets with only one training split, the data is deterministically
-    partitioned into independent train/validation/test subsets.
-
-    Protocol:
-        1. Reserve test_split_pct of the full dataset for test.
-        2. Split the remaining pool into train and validation using
-           validation_split_pct.
-        3. If sampling is enabled, select sample_size examples from train.
-        4. Validation and test are never sampled by sample_size.
-
-    Returns:
-        DatasetDict with:
-            - "train"
-            - "validation"
-            - "test"
-
-    Notes:
-        - Audio is cast to 16 kHz.
-        - The transcript column is standardized to "sentence".
-        - Splits are deterministic given seed.
-    """
-
-    # ------------------------------------------------------------------
-    # 1. Local CSV input
-    # ------------------------------------------------------------------
     if train_csv:
-        data_files = {"train": train_csv}
+        from datasets import Audio as AudioFeature
+        from datasets import load_dataset as hf_load_dataset
 
+        files = {"train": train_csv}
         if eval_csv:
-            data_files["validation"] = eval_csv
+            files["validation"] = eval_csv
 
-        ds = load_dataset("csv", data_files=data_files)
-
-        if "validation" not in ds:
-            split = ds["train"].train_test_split(
+        loaded = hf_load_dataset("csv", data_files=files)
+        if "validation" not in loaded:
+            split_result = loaded["train"].train_test_split(
                 test_size=validation_split_pct,
                 seed=seed,
             )
-
-            ds = DatasetDict(
-                train=split["train"],
-                validation=split["test"],
-            )
-
-        # Standardize column names.
-        if audio_column != "audio":
-            for split_name in ds:
-                ds[split_name] = ds[split_name].rename_column(
-                    audio_column,
-                    "audio",
-                )
-
-        if text_column != "sentence":
-            for split_name in ds:
-                ds[split_name] = ds[split_name].rename_column(
-                    text_column,
-                    "sentence",
-                )
-
-        ds = ds.cast_column(
-            "audio",
-            Audio(sampling_rate=16000),
-        )
-
-        return ds
-
-    # ------------------------------------------------------------------
-    # 2. Hugging Face dataset
-    # ------------------------------------------------------------------
-    if not dataset_name:
-        raise ValueError(
-            "Provide either --train_csv (+ optional --eval_csv) "
-            "or --dataset_name."
-        )
-
-    ds_all = load_dataset(
-        dataset_name,
-        dataset_config,
-    )
-
-    # ------------------------------------------------------------------
-    # Case A: official train / validation / test splits exist.
-    # ------------------------------------------------------------------
-    if (
-        eval_split
-        and eval_split in ds_all
-        and test_split
-        and test_split in ds_all
-    ):
-        train_raw = ds_all[train_split]
-        eval_raw = ds_all[eval_split]
-        test_raw = ds_all[test_split]
-
-    # ------------------------------------------------------------------
-    # Case B: only a train split exists.
-    #
-    # This is the case for:
-    # Digital-Divide-Data/Luhya-ASR-Data-subset-642H
-    # ------------------------------------------------------------------
+            loaded = DatasetDict({
+                "train": split_result["train"],
+                "validation": split_result["test"],
+            })
+        dataset_dict = loaded
     else:
-        full_train = ds_all[train_split]
+        if not dataset_name:
+            raise ValueError("Provide dataset_name or train_csv.")
 
-        if not 0 < test_split_pct < 1:
-            raise ValueError(
-                "test_split_pct must be strictly between 0 and 1."
-            )
-
-        if not 0 < validation_split_pct < 1:
-            raise ValueError(
-                "validation_split_pct must be strictly between 0 and 1."
-            )
-
-        # First isolate the test set.
-        test_partition = full_train.train_test_split(
-            test_size=test_split_pct,
-            seed=seed,
+        loaded = load_dataset(
+            dataset_name,
+            dataset_config,
+            **({"split": train_split} if train_split else {}),
         )
 
-        train_val_pool = test_partition["train"]
-        test_raw = test_partition["test"]
+        # A single Dataset was loaded when split=train; build all three
+        # disjoint splits from that source when duration targets are requested.
+        if not isinstance(loaded, DatasetDict):
+            if sample and target_train_hours is not None:
+                dataset_dict = _select_splits_by_hours(
+                    loaded,
+                    audio_column=audio_column,
+                    target_train_hours=target_train_hours,
+                    validation_split_pct=validation_split_pct,
+                    test_split_pct=test_split_pct,
+                    seed=seed,
+                )
+            elif sample and sample_size is not None:
+                count = min(int(sample_size), len(loaded))
+                loaded = loaded.shuffle(seed=seed).select(range(count))
+                split_test = loaded.train_test_split(
+                    test_size=test_split_pct, seed=seed
+                )
+                train_val = split_test["train"].train_test_split(
+                    test_size=validation_split_pct
+                    / (1.0 - test_split_pct),
+                    seed=seed,
+                )
+                dataset_dict = DatasetDict({
+                    "train": train_val["train"],
+                    "validation": train_val["test"],
+                    "test": split_test["test"],
+                })
+            else:
+                # Keep an existing single-split workflow usable.
+                dataset_dict = DatasetDict({"train": loaded})
+        else:
+            # Respect existing official splits if supplied by the dataset.
+            dataset_dict = loaded
 
-        # Then split the remaining pool into train and validation.
-        train_val_partition = train_val_pool.train_test_split(
-            test_size=validation_split_pct,
-            seed=seed,
-        )
-
-        train_raw = train_val_partition["train"]
-        eval_raw = train_val_partition["test"]
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
-    if sample:
-        if sample_size is None:
+    # Normalize the transcript column to "sentence".
+    normalized = {}
+    for split_name, subset in dataset_dict.items():
+        if audio_column not in subset.column_names:
             raise ValueError(
-                "sample_size must be specified when sample=True."
+                f"Audio column '{audio_column}' missing in split '{split_name}'. "
+                f"Available: {subset.column_names}"
             )
 
-        if sample_size > len(train_raw):
-            raise ValueError(
-                f"sample_size={sample_size} exceeds the available "
-                f"training pool ({len(train_raw)} examples)."
-            )
+        if text_column not in subset.column_names:
+            if text_column == "transcripts" and "sentence" in subset.column_names:
+                actual_text_column = "sentence"
+            else:
+                raise ValueError(
+                    f"Text column '{text_column}' missing in split '{split_name}'. "
+                    f"Available: {subset.column_names}"
+                )
+        else:
+            actual_text_column = text_column
 
-        train_raw = train_raw.shuffle(
-            seed=seed,
-        ).select(
-            range(sample_size)
-        )
+        if actual_text_column != "sentence":
+            if "sentence" in subset.column_names:
+                subset = subset.remove_columns(["sentence"])
+            subset = subset.rename_column(actual_text_column, "sentence")
 
-    # ------------------------------------------------------------------
-    # Build benchmark splits.
-    # Validation and test remain independent and are never sampled.
-    # ------------------------------------------------------------------
-    ds = DatasetDict(
-        {
-            "train": train_raw,
-            "validation": eval_raw,
-            "test": test_raw,
-        }
-    )
+        # Ensure the audio feature is standardized to 16 kHz for model inputs.
+        subset = subset.cast_column(audio_column, Audio(sampling_rate=16000))
+        normalized[split_name] = subset
 
-    # ------------------------------------------------------------------
-    # Standardize column names.
-    # ------------------------------------------------------------------
-    if audio_column != "audio":
-        for split_name in ds:
-            ds[split_name] = ds[split_name].rename_column(
-                audio_column,
-                "audio",
-            )
-
-    if text_column != "sentence":
-        for split_name in ds:
-            ds[split_name] = ds[split_name].rename_column(
-                text_column,
-                "sentence",
-            )
-
-    # ------------------------------------------------------------------
-    # Standardize audio sampling rate.
-    # ------------------------------------------------------------------
-    ds = ds.cast_column(
-        "audio",
-        Audio(sampling_rate=16000),
-    )
-
-    return ds
+    return DatasetDict(normalized)
