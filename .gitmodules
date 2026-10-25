@@ -1,0 +1,3 @@
+[submodule "external/S3QA"]
+	path = external/S3QA
+	url = https://github.com/mogg64/S3QA.git

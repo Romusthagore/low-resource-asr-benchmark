@@ -250,3 +250,7 @@ checkpoints/
 *.pth
 *.ckpt
 *.safetensors
+
+# Track reproducibility requirements
+!environments/
+!environments/*-requirements.txt
