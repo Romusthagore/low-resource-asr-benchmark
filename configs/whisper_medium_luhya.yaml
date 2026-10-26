@@ -22,7 +22,7 @@ audio_column: "audio"
 
 # --- Sampling / splitting ---
 sample: true
-target_train_hours: 100
+target_train_hours: 50
 sample_size: null
 
 # Use single-process preprocessing.
@@ -30,7 +30,7 @@ sample_size: null
 num_proc: null
 
 validation_split_pct: 0.1
-max_eval_samples: 1000
+max_eval_samples: 0
 test_split_pct: 0.1
 
 seed: 42
@@ -51,7 +51,7 @@ low_cpu_mem_usage: true
 use_safetensors: true
 
 # --- Output ---
-output_dir: "/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/whisper-medium-luhya_642h_100h_seed42"
+output_dir: "/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/whisper-medium-luhya-representative_50h_seed42"
 
 # --- Training hyperparameters ---
 # Same effective batch size as the previously validated baseline:

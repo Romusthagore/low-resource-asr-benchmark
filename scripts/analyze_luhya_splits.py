@@ -4,7 +4,7 @@ import numpy as np
 
 BASE = Path(
     "/network/scratch/a/ahomagnr/low-resource-asr-benchmark/"
-    "outputs/luhya_fixed_splits_seed42_v5"
+    "outputs/luhya_fixed_splits_seed42"
 )
 
 FILES = {

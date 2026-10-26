@@ -1,3 +1,4 @@
+from african_asr.data.split_loader import load_fixed_luhya_splits
 """Dataset loading and reproducible duration-based splitting utilities."""
 
 import io
@@ -145,9 +146,26 @@ def load_asr_dataset(
     validation_split_pct=0.1,
     test_split_pct=0.1,
     seed=42,
+    use_fixed_splits=True,
     **kwargs,
 ):
-    """Load ASR data and optionally create duration-controlled splits."""
+    """Load ASR data using fixed recording-disjoint splits by default."""
+
+    if use_fixed_splits and train_csv is None:
+        print("[ASR data] Using representative recording-disjoint Luhya splits")
+
+        dataset_dict = load_fixed_luhya_splits(
+            target_train_hours=(
+                target_train_hours
+                if target_train_hours is not None
+                else 50
+            ),
+            seed=seed,
+            sampling_rate=16000,
+            materialize=True,
+        )
+
+        return dataset_dict
 
     if train_csv:
         from datasets import Audio as AudioFeature

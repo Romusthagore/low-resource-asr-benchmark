@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Luhya V3: speaker-disjoint, gender/S3QA-balanced splits.
+"""Luhya: speaker-disjoint, gender/S3QA-balanced splits.
 
 Dominant dialects are coverage constraints only.
 No dialect balancing is performed.
@@ -599,7 +599,7 @@ def main():
 
     if best is None:
         raise RuntimeError(
-            "No feasible V3 solution found. "
+            "No feasible split solution found. "
             "No output files were created."
         )
 

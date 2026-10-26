@@ -35,7 +35,7 @@ if ! ls "$HF_HUB_CACHE" 2>/dev/null | grep -qi 'whisper-medium'; then
 fi
 echo "Whisper-medium checkpoint found in HF cache"
 
-WORK_DIR=/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/whisper-medium-luhya_642h_100h_seed42
+WORK_DIR=/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/whisper-medium-luhya-representative_50h_seed42
 mkdir -p "$WORK_DIR"
 
 srun python -m african_asr.finetuning.whisper_train \

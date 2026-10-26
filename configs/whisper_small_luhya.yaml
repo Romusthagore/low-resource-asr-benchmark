@@ -2,11 +2,10 @@
 #
 # Protocol:
 # - Dataset: Digital-Divide-Data/Luhya-ASR-Data-subset-642H
-# - 15,000 training examples
-# - deterministic seed = 42
-# - 10% held out for test
-# - remaining data split into train/validation
-# - same train/eval/test protocol for all benchmark models
+# - Representative recording-disjoint splits (seed = 42)
+# - Train: 50 hours; validation: 5 hours; test: 10 hours
+# - Speaker overlap allowed across splits
+# - Same fixed manifests for all benchmark models
 
 # --- Data ---
 dataset_name: "Digital-Divide-Data/Luhya-ASR-Data-subset-642H"
@@ -29,7 +28,7 @@ sample_size: null
 # Multiprocessing caused Dataset.map to hang on the Mila environment.
 num_proc: null
 validation_split_pct: 0.1
-max_eval_samples: 1000
+max_eval_samples: 0
 test_split_pct: 0.1
 seed: 42
 
@@ -48,7 +47,7 @@ low_cpu_mem_usage: true
 use_safetensors: true
 
 # --- Output ---
-output_dir: "/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/whisper-small_luhya_642h_50h_seed42/final_model"
+output_dir: "/network/scratch/a/ahomagnr/low-resource-asr-benchmark/outputs/whisper-small-luhya-representative_50h_seed42"
 
 # --- Training hyperparameters ---
 # Same effective batch size as the previously validated baseline:
@@ -63,8 +62,8 @@ num_train_epochs: 10
 max_steps: -1
 
 # --- Evaluation / checkpointing ---
-eval_steps: 200
-save_steps: 200
+eval_steps: 500
+save_steps: 500
 logging_steps: 10
 
 save_total_limit: 2
