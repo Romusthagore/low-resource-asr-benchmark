@@ -13,9 +13,9 @@ import yaml
 from jiwer import wer, cer
 from torch.nn.utils.rnn import pad_sequence
 
-from african_asr.data.loaders import load_asr_dataset
-from african_asr.models.afrihubert import load_afrihubert
-from african_asr.utils.compute import ComputeTracker
+from src.data.loaders import load_dataset_with_splits
+from src.models.afrihubert import load_afrihubert
+from src.utils.compute import ComputeTracker
 
 
 DEFAULT_MODEL = "ajesujoba/AfriHuBERT"
@@ -23,7 +23,14 @@ DEFAULT_CONFIG = "configs/afrihubert_luhya.yaml"
 
 
 class AfriHuBERTCTC(nn.Module):
-    """Official AfriHuBERT downstream ASR architecture."""
+    """Custom CTC head for AfriHuBERT.
+
+    NOTE: this architecture (3 feed-forward blocks of 1024 units with
+    LayerNorm + LeakyReLU + dropout) has not been verified against the
+    original AfriHuBERT paper. Treat it as a reasonable custom CTC head,
+    not as a reproduction of a published architecture, unless confirmed
+    otherwise.
+    """
 
     def __init__(self, encoder, vocab_size):
         super().__init__()
@@ -31,26 +38,27 @@ class AfriHuBERTCTC(nn.Module):
         self.encoder = encoder
 
         self.linear1 = nn.Linear(encoder.config.hidden_size, 1024)
-        self.bn1 = nn.BatchNorm1d(1024)
+        self.norm1 = nn.LayerNorm(1024)
         self.act1 = nn.LeakyReLU()
         self.drop1 = nn.Dropout(0.15)
 
         self.linear2 = nn.Linear(1024, 1024)
-        self.bn2 = nn.BatchNorm1d(1024)
+        self.norm2 = nn.LayerNorm(1024)
         self.act2 = nn.LeakyReLU()
         self.drop2 = nn.Dropout(0.15)
 
         self.linear3 = nn.Linear(1024, 1024)
-        self.bn3 = nn.BatchNorm1d(1024)
+        self.norm3 = nn.LayerNorm(1024)
         self.act3 = nn.LeakyReLU()
 
         self.ctc_lin = nn.Linear(1024, vocab_size)
 
-    def _block(self, hidden, linear, batch_norm, activation, dropout=None):
+    def _block(self, hidden, linear, norm, activation, dropout=None):
         hidden = linear(hidden)
-        hidden = hidden.transpose(1, 2)
-        hidden = batch_norm(hidden)
-        hidden = hidden.transpose(1, 2)
+        # LayerNorm normalizes over the feature dimension independently
+        # for each (batch, time) position, so padded time steps don't
+        # contaminate the statistics the way BatchNorm1d would.
+        hidden = norm(hidden)
         hidden = activation(hidden)
 
         if dropout is not None:
@@ -66,28 +74,9 @@ class AfriHuBERTCTC(nn.Module):
 
         hidden = outputs.last_hidden_state
 
-        hidden = self._block(
-            hidden,
-            self.linear1,
-            self.bn1,
-            self.act1,
-            self.drop1,
-        )
-
-        hidden = self._block(
-            hidden,
-            self.linear2,
-            self.bn2,
-            self.act2,
-            self.drop2,
-        )
-
-        hidden = self._block(
-            hidden,
-            self.linear3,
-            self.bn3,
-            self.act3,
-        )
+        hidden = self._block(hidden, self.linear1, self.norm1, self.act1, self.drop1)
+        hidden = self._block(hidden, self.linear2, self.norm2, self.act2, self.drop2)
+        hidden = self._block(hidden, self.linear3, self.norm3, self.act3)
 
         logits = self.ctc_lin(hidden)
 
@@ -122,7 +111,63 @@ def set_seed(seed):
         torch.cuda.manual_seed(seed)
 
 
-def prepare_examples(dataset, max_audio_length):
+def load_train_eval_splits(config):
+    """Load the dataset and return (train_dataset, eval_dataset).
+
+    Uses `load_dataset_with_splits`, which already returns canonical
+    keys ("train", "validation", "test") for whichever splits actually
+    exist, and already resamples audio to 16 kHz.
+
+    If no validation split exists, a slice is carved out of train. When
+    a "speaker_name" column is available, the fallback split is made
+    speaker-disjoint (no speaker appears in both train and validation);
+    otherwise it falls back to a plain random split, with a warning,
+    since a non-disjoint split can leak speaker identity between the
+    two sets.
+    """
+
+    dataset = load_dataset_with_splits(
+        config["dataset_name"],
+        audio_column=config.get("audio_column", "audio"),
+    )
+
+    train_dataset = dataset["train"]
+
+    if "validation" in dataset:
+        return train_dataset, dataset["validation"]
+
+    val_pct = config.get("fallback_validation_pct", 0.1)
+    print(f"No validation split found; carving out {val_pct:.0%} of train.")
+
+    if "speaker_name" in train_dataset.column_names:
+        from sklearn.model_selection import GroupShuffleSplit
+
+        speakers = train_dataset["speaker_name"]
+        splitter = GroupShuffleSplit(
+            n_splits=1, test_size=val_pct, random_state=config["seed"]
+        )
+        train_idx, val_idx = next(
+            splitter.split(X=range(len(speakers)), groups=speakers)
+        )
+        train_split = train_dataset.select(train_idx.tolist())
+        eval_split = train_dataset.select(val_idx.tolist())
+        print(
+            f"Speaker-disjoint fallback split: {len(train_split)} train / "
+            f"{len(eval_split)} validation examples."
+        )
+    else:
+        print(
+            "WARNING: no 'speaker_name' column found; falling back to a "
+            "random split that is NOT speaker-disjoint. Speaker identity "
+            "may leak between train and validation."
+        )
+        split = train_dataset.train_test_split(test_size=val_pct, seed=config["seed"])
+        train_split, eval_split = split["train"], split["test"]
+
+    return train_split, eval_split
+
+
+def prepare_examples(dataset, max_audio_length, text_column):
     examples = []
 
     for example in dataset:
@@ -138,11 +183,16 @@ def prepare_examples(dataset, max_audio_length):
         if duration > max_audio_length:
             continue
 
+        text = example[text_column]
+
+        if not text:
+            continue
+
         examples.append(
             {
                 "audio": waveform,
                 "sampling_rate": sampling_rate,
-                "sentence": example["sentence"],
+                "sentence": text,
             }
         )
 
@@ -150,7 +200,12 @@ def prepare_examples(dataset, max_audio_length):
 
 
 def build_character_vocabulary(examples):
-    """Build character vocabulary from training transcripts."""
+    """Build a CTC-only character vocabulary from training transcripts.
+
+    Only a blank token and an explicit unknown-character token are
+    added; <bos>/<eos> are not meaningful for CTC (no autoregressive
+    decoder here) and are intentionally omitted.
+    """
 
     characters = set()
 
@@ -159,8 +214,7 @@ def build_character_vocabulary(examples):
 
     vocabulary = {
         "<blank>": 0,
-        "<bos>": 1,
-        "<eos>": 2,
+        "<unk>": 1,
     }
 
     for character in sorted(characters):
@@ -170,15 +224,30 @@ def build_character_vocabulary(examples):
     return vocabulary
 
 
-def encode_text(text, vocabulary):
-    return [
-        vocabulary[character]
-        for character in text
-        if character in vocabulary
-    ]
+def encode_text(text, vocabulary, unk_counter=None):
+    """Encode text to token ids.
+
+    Characters absent from the training vocabulary are mapped to
+    <unk> rather than silently dropped, so targets are never silently
+    truncated. `unk_counter`, if given, is incremented in place for
+    each substitution, so the caller can report how often this happens.
+    """
+
+    unk_id = vocabulary["<unk>"]
+    tokens = []
+
+    for character in text:
+        token_id = vocabulary.get(character, unk_id)
+
+        if token_id == unk_id and character not in vocabulary and unk_counter is not None:
+            unk_counter[0] += 1
+
+        tokens.append(token_id)
+
+    return tokens
 
 
-def collate_batch(batch, vocabulary, device):
+def collate_batch(batch, vocabulary, device, unk_counter=None):
     waveforms = []
     targets = []
     target_lengths = []
@@ -194,6 +263,7 @@ def collate_batch(batch, vocabulary, device):
         tokens = encode_text(
             example["sentence"],
             vocabulary,
+            unk_counter=unk_counter,
         )
 
         target = torch.tensor(
@@ -264,6 +334,53 @@ def decode_ctc_predictions(logits, output_lengths, id_to_token):
         decoded.append("".join(tokens))
 
     return decoded
+
+
+def sanity_check_output_lengths(model, batch, vocabulary, device):
+    """Pilot-level check: verify output_lengths are consistent with the
+    model's actual output before running a full training loop.
+
+    This does not prove the conv-length formula is exactly right for
+    every input, but it catches gross mismatches (e.g. output_lengths
+    exceeding the logits' time dimension) early, as recommended before
+    trusting `_get_feat_extract_output_lengths` for a given encoder.
+    """
+
+    model.eval()
+
+    with torch.no_grad():
+        (
+            input_values,
+            attention_mask,
+            _targets,
+            input_lengths,
+            _target_lengths,
+        ) = collate_batch(batch, vocabulary, device)
+
+        logits = model(input_values=input_values, attention_mask=attention_mask)
+
+        output_lengths = model.encoder._get_feat_extract_output_lengths(
+            input_lengths
+        ).to(device)
+
+        max_output_length = logits.shape[1]
+
+        if (output_lengths > max_output_length).any():
+            raise RuntimeError(
+                f"Sanity check failed: computed output_lengths "
+                f"(max={output_lengths.max().item()}) exceed the model's "
+                f"actual output time dimension ({max_output_length}). "
+                f"_get_feat_extract_output_lengths may not match this "
+                f"encoder's real downsampling."
+            )
+
+        print(
+            f"Sanity check passed: output_lengths in "
+            f"[{output_lengths.min().item()}, {output_lengths.max().item()}], "
+            f"logits time dimension = {max_output_length}."
+        )
+
+    model.train()
 
 
 @torch.no_grad()
@@ -385,37 +502,27 @@ def main():
     print(f"Seed: {config['seed']}")
     print(f"Model: {config['model_name']}")
 
-    dataset = load_asr_dataset(
-        dataset_name=config["dataset_name"],
-        dataset_config=config.get("dataset_config"),
-        train_split=config["train_split"],
-        eval_split=config["eval_split"],
-        text_column=config["text_column"],
-        audio_column=config["audio_column"],
-        sample=config["sample"],
-        sample_size=config["sample_size"],
-        target_train_hours=config.get("target_train_hours"),
-        validation_split_pct=config["validation_split_pct"],
-        test_split_pct=config.get("test_split_pct", 0.1),
-        seed=config["seed"],
-    )
+    train_split, eval_split = load_train_eval_splits(config)
+
+    text_column = config.get("text_column", "sentence")
 
     train_examples = prepare_examples(
-        dataset["train"],
+        train_split,
         config["max_audio_length"],
+        text_column,
     )
 
-    eval_dataset = dataset["validation"]
     max_eval_samples = config.get("max_eval_samples")
 
     if max_eval_samples is not None:
-        eval_dataset = eval_dataset.select(
-            range(min(max_eval_samples, len(eval_dataset)))
+        eval_split = eval_split.select(
+            range(min(max_eval_samples, len(eval_split)))
         )
 
     eval_examples = prepare_examples(
-        eval_dataset,
+        eval_split,
         config["max_audio_length"],
+        text_column,
     )
 
     print(f"Train examples: {len(train_examples)}")
@@ -438,6 +545,10 @@ def main():
             ensure_ascii=False,
             indent=2,
         )
+
+    # Also save the config itself, for traceability.
+    with open(output_dir / "config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, allow_unicode=True)
 
     encoder, _ = load_afrihubert(
         model_name=config["model_name"],
@@ -512,6 +623,11 @@ def main():
         zero_infinity=True,
     )
 
+    # Pilot-level sanity check before committing to a full training run.
+    if train_examples:
+        pilot_batch = train_examples[: min(4, len(train_examples))]
+        sanity_check_output_lengths(model, pilot_batch, vocabulary, device)
+
     compute_tracker = ComputeTracker()
 
     if config.get("track_compute", True):
@@ -526,7 +642,6 @@ def main():
 
     best_wer = float("inf")
 
-    global_step = 0
     optimizer_steps = 0
 
     for epoch in range(
@@ -534,24 +649,37 @@ def main():
     ):
         model.train()
 
+        # Reproducible per-epoch shuffle, so examples aren't always
+        # presented in the same order (which can bias optimization if
+        # the data is grouped by speaker, duration, or domain).
+        epoch_rng = random.Random(config["seed"] + epoch)
+        epoch_examples = train_examples[:]
+        epoch_rng.shuffle(epoch_examples)
+
         running_loss = 0.0
         batch_count = 0
+        unk_counter = [0]
 
         total_batches = (
-            len(train_examples)
+            len(epoch_examples)
             + config["batch_size"]
             - 1
         ) // config["batch_size"]
 
+        # Reset every epoch, instead of a never-reset global step: an
+        # ever-increasing counter checked against a fixed modulo drifts
+        # out of alignment with each epoch's own batch boundaries.
+        accum_count = 0
+
         for batch_index, start in enumerate(
             range(
                 0,
-                len(train_examples),
+                len(epoch_examples),
                 config["batch_size"],
             ),
             start=1,
         ):
-            batch = train_examples[
+            batch = epoch_examples[
                 start : start + config["batch_size"]
             ]
 
@@ -565,6 +693,7 @@ def main():
                 batch,
                 vocabulary,
                 device,
+                unk_counter=unk_counter,
             )
 
             logits = model(
@@ -609,16 +738,15 @@ def main():
 
             loss.backward()
 
-            global_step += 1
+            accum_count += 1
 
             is_last_batch = (
                 batch_index == total_batches
             )
 
             should_step = (
-                global_step
-                % config["grad_accumulation_factor"]
-                == 0
+                accum_count
+                == config["grad_accumulation_factor"]
             ) or is_last_batch
 
             if should_step:
@@ -633,10 +761,18 @@ def main():
                     encoder_optimizer.zero_grad()
 
                 optimizer_steps += 1
+                accum_count = 0
 
         average_train_loss = (
             running_loss / max(1, batch_count)
         )
+
+        if unk_counter[0] > 0:
+            print(
+                f"Warning: {unk_counter[0]} characters were mapped to "
+                f"<unk> during this epoch (out-of-vocabulary for the "
+                f"training set)."
+            )
 
         validation_metrics = evaluate_model(
             model=model,
@@ -650,6 +786,7 @@ def main():
         epoch_metrics = {
             "epoch": epoch + 1,
             "train_loss": average_train_loss,
+            "train_unk_substitutions": unk_counter[0],
             **validation_metrics,
         }
 
