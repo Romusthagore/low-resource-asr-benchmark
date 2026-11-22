@@ -10,12 +10,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from jiwer import wer, cer
+from src.evaluation.metrics import (
+    compute_asr_metrics,
+    decode_ctc_predictions,
+)
 from torch.nn.utils.rnn import pad_sequence
 
 from src.data.loaders import load_dataset_with_splits
 from src.models.afrihubert import load_afrihubert
 from src.utils.compute import ComputeTracker
+from src.utils.training_checkpoint import (
+    capture_rng_state,
+    restore_rng_state,
+    save_checkpoint,
+    load_checkpoint,
+)
 
 
 DEFAULT_MODEL = "ajesujoba/AfriHuBERT"
@@ -334,35 +343,6 @@ def collate_batch(batch, vocabulary, device, unk_counter=None):
     )
 
 
-def decode_ctc_predictions(logits, output_lengths, id_to_token):
-    """Greedy CTC decoding."""
-
-    predictions = logits.argmax(dim=-1)
-
-    decoded = []
-
-    for prediction, length in zip(predictions, output_lengths):
-        sequence = prediction[: int(length)].tolist()
-
-        tokens = []
-        previous = None
-
-        for token_id in sequence:
-            if token_id == 0:
-                previous = token_id
-                continue
-
-            if token_id == previous:
-                continue
-
-            tokens.append(id_to_token[token_id])
-            previous = token_id
-
-        decoded.append("".join(tokens))
-
-    return decoded
-
-
 def sanity_check_output_lengths(model, batch, vocabulary, device):
     """Pilot-level check: verify output_lengths are consistent with the
     model's actual output before running a full training loop.
@@ -493,20 +473,14 @@ def evaluate_model(
 
     average_loss = total_loss / max(1, total_batches)
 
-    validation_wer = wer(
-        references,
-        predictions,
-    )
-
-    validation_cer = cer(
+    metrics = compute_asr_metrics(
         references,
         predictions,
     )
 
     return {
         "eval_loss": average_loss,
-        "wer": validation_wer,
-        "cer": validation_cer,
+        **metrics,
     }
 
 
@@ -541,6 +515,15 @@ def main():
     train_split, eval_split = load_train_eval_splits(config)
 
     text_column = config.get("text_column", "sentence")
+
+    max_train_samples = config.get("max_train_samples")
+    if max_train_samples is not None:
+        max_train_samples = int(max_train_samples)
+        if max_train_samples < 1:
+            raise ValueError("max_train_samples must be >= 1")
+        train_split = train_split.select(
+            range(min(max_train_samples, len(train_split)))
+        )
 
     train_examples = prepare_examples(
         train_split,
@@ -659,10 +642,164 @@ def main():
         zero_infinity=True,
     )
 
-    # Pilot-level sanity check before committing to a full training run.
+
+
+    # Full-state checkpoint for automatic resume.
+    checkpoint_file = output_dir / "last_checkpoint.pt"
+    checkpoint_interval = int(config["checkpoint_steps"])
+    save_each_epoch = config["save_each_epoch"]
+    resume_enabled = config["resume_from_checkpoint"]
+    save_best_model = config["save_best_model"]
+    best_metric = config["best_model_metric"]
+    best_mode = config["best_model_mode"]
+
+    if best_metric not in ("wer", "cer", "eval_loss"):
+        raise ValueError(f"Unsupported best_model_metric: {best_metric}")
+
+    if best_mode not in ("min", "max"):
+        raise ValueError(f"Unsupported best_model_mode: {best_mode}")
+
+    if not save_best_model:
+        raise ValueError(
+            "save_best_model must be true because the final model "
+            "is loaded from best_model.pt"
+        )
+
+    if checkpoint_interval < 1:
+        raise ValueError("checkpoint_steps must be >= 1")
+
+    metrics_history = []
+    best_wer = float("inf") if best_mode == "min" else float("-inf")
+    optimizer_steps = 0
+    start_epoch = 0
+    start_batch = 0
+
+    resume_running_loss = 0.0
+    resume_batch_count = 0
+    resume_unk_count = 0
+
+    if resume_enabled and checkpoint_file.is_file():
+        checkpoint = load_checkpoint(
+            checkpoint_file,
+            map_location="cpu",
+        )
+
+        if checkpoint.get("version") != 1:
+            raise RuntimeError("Unsupported checkpoint format")
+
+        if checkpoint["seed"] != config["seed"]:
+            raise RuntimeError("Checkpoint seed does not match config")
+
+        if checkpoint["batch_size"] != config["batch_size"]:
+            raise RuntimeError("Checkpoint batch size does not match config")
+
+        if checkpoint["grad_accumulation_factor"] != config["grad_accumulation_factor"]:
+            raise RuntimeError("Gradient accumulation configuration changed")
+
+        if checkpoint["dataset_name"] != config["dataset_name"]:
+            raise RuntimeError("Checkpoint dataset does not match config")
+
+        if checkpoint["model_name"] != config["model_name"]:
+            raise RuntimeError("Checkpoint model does not match config")
+
+        if checkpoint["vocabulary"] != vocabulary:
+            raise RuntimeError("Checkpoint vocabulary does not match")
+
+        if checkpoint["train_size"] != len(train_examples):
+            raise RuntimeError("Training dataset size changed")
+
+        if checkpoint["eval_size"] != len(eval_examples):
+            raise RuntimeError("Validation dataset size changed")
+
+        model.load_state_dict(checkpoint["model"])
+        model_optimizer.load_state_dict(checkpoint["model_optimizer"])
+
+        if encoder_optimizer is not None:
+            if checkpoint["encoder_optimizer"] is None:
+                raise RuntimeError("Missing encoder optimizer state")
+            encoder_optimizer.load_state_dict(
+                checkpoint["encoder_optimizer"]
+            )
+        elif checkpoint["encoder_optimizer"] is not None:
+            raise RuntimeError("Unexpected encoder optimizer state")
+
+        start_epoch = checkpoint["next_epoch"]
+        start_batch = checkpoint["next_batch"]
+        if checkpoint.get("best_metric", "wer") != best_metric:
+            raise RuntimeError("Best metric changed since checkpoint")
+
+        if checkpoint.get("best_mode", "min") != best_mode:
+            raise RuntimeError("Best metric direction changed")
+
+        best_wer = checkpoint["best_wer"]
+        optimizer_steps = checkpoint["optimizer_steps"]
+        metrics_history = checkpoint["metrics_history"]
+
+        resume_running_loss = checkpoint["running_loss"]
+        resume_batch_count = checkpoint["batch_count"]
+        resume_unk_count = checkpoint["unk_count"]
+
+        if best_wer != (
+            float("inf") if best_mode == "min" else float("-inf")
+        ) and not (
+            output_dir / "best_model.pt"
+        ).is_file():
+            raise RuntimeError(
+                "Best model is missing; refusing inconsistent resume"
+            )
+
+        restore_rng_state(checkpoint["rng_state"])
+
+        print(
+            f"Resuming at epoch {start_epoch + 1}, "
+            f"batch {start_batch + 1}, "
+            f"optimizer step {optimizer_steps}",
+            flush=True,
+        )
+
+    # Verify output lengths using the restored model.
     if train_examples:
         pilot_batch = train_examples[: min(4, len(train_examples))]
-        sanity_check_output_lengths(model, pilot_batch, vocabulary, device)
+        sanity_check_output_lengths(
+            model, pilot_batch, vocabulary, device
+        )
+
+    def save_training_state(
+        next_epoch,
+        next_batch,
+        running_loss,
+        batch_count,
+        unk_count,
+    ):
+        state = {
+            "version": 1,
+            "model": model.state_dict(),
+            "model_optimizer": model_optimizer.state_dict(),
+            "encoder_optimizer": (
+                encoder_optimizer.state_dict()
+                if encoder_optimizer is not None else None
+            ),
+            "next_epoch": next_epoch,
+            "next_batch": next_batch,
+            "running_loss": running_loss,
+            "batch_count": batch_count,
+            "unk_count": unk_count,
+            "best_wer": best_wer,
+            "best_metric": best_metric,
+            "best_mode": best_mode,
+            "optimizer_steps": optimizer_steps,
+            "metrics_history": metrics_history,
+            "seed": config["seed"],
+            "batch_size": config["batch_size"],
+            "grad_accumulation_factor": config["grad_accumulation_factor"],
+            "dataset_name": config["dataset_name"],
+            "model_name": config["model_name"],
+            "vocabulary": vocabulary,
+            "train_size": len(train_examples),
+            "eval_size": len(eval_examples),
+            "rng_state": capture_rng_state(),
+        }
+        save_checkpoint(checkpoint_file, state)
 
     compute_tracker = ComputeTracker()
 
@@ -674,49 +811,35 @@ def main():
     if encoder_optimizer is not None:
         encoder_optimizer.zero_grad()
 
-    metrics_history = []
-
-    best_wer = float("inf")
-
-    optimizer_steps = 0
-
-    for epoch in range(
-        config["number_of_epochs"]
-    ):
+    for epoch in range(start_epoch, config["number_of_epochs"]):
         model.train()
 
-        # Reproducible per-epoch shuffle, so examples aren't always
-        # presented in the same order (which can bias optimization if
-        # the data is grouped by speaker, duration, or domain).
         epoch_rng = random.Random(config["seed"] + epoch)
         epoch_examples = train_examples[:]
         epoch_rng.shuffle(epoch_examples)
 
-        running_loss = 0.0
-        batch_count = 0
-        unk_counter = [0]
-
         total_batches = (
-            len(epoch_examples)
-            + config["batch_size"]
-            - 1
+            len(epoch_examples) + config["batch_size"] - 1
         ) // config["batch_size"]
 
-        # Reset every epoch, instead of a never-reset global step: an
-        # ever-increasing counter checked against a fixed modulo drifts
-        # out of alignment with each epoch's own batch boundaries.
+        first_batch = start_batch if epoch == start_epoch else 0
+
+        running_loss = (
+            resume_running_loss if epoch == start_epoch else 0.0
+        )
+        batch_count = (
+            resume_batch_count if epoch == start_epoch else 0
+        )
+        unk_counter = [
+            resume_unk_count if epoch == start_epoch else 0
+        ]
+
         accum_count = 0
 
-        for batch_index, start in enumerate(
-            range(
-                0,
-                len(epoch_examples),
-                config["batch_size"],
-            ),
-            start=1,
-        ):
+        for batch_index in range(first_batch, total_batches):
+            start = batch_index * config["batch_size"]
             batch = epoch_examples[
-                start : start + config["batch_size"]
+                start:start + config["batch_size"]
             ]
 
             (
@@ -726,9 +849,7 @@ def main():
                 input_lengths,
                 target_lengths,
             ) = collate_batch(
-                batch,
-                vocabulary,
-                device,
+                batch, vocabulary, device,
                 unk_counter=unk_counter,
             )
 
@@ -737,24 +858,19 @@ def main():
                 attention_mask=attention_mask,
             )
 
-            if batch_index == 1 or batch_index % 50 == 0:
+            if batch_index == 0 or (batch_index + 1) % 50 == 0:
                 print(
                     f"Epoch {epoch + 1}/{config['number_of_epochs']} "
-                    f"- batch {batch_index}/{total_batches}",
+                    f"- batch {batch_index + 1}/{total_batches}",
                     flush=True,
                 )
 
-            log_probs = F.log_softmax(
-                logits,
-                dim=-1,
-            )
+            log_probs = F.log_softmax(logits, dim=-1)
 
             output_lengths = (
-                model.encoder
-                ._get_feat_extract_output_lengths(
+                model.encoder._get_feat_extract_output_lengths(
                     input_lengths
-                )
-                .to(device)
+                ).to(device)
             )
 
             raw_loss = ctc_loss(
@@ -767,25 +883,21 @@ def main():
             running_loss += raw_loss.item()
             batch_count += 1
 
-            loss = (
-                raw_loss
-                / config["grad_accumulation_factor"]
+            # Normalize by the actual accumulation group size.
+            accumulation = config["grad_accumulation_factor"]
+            group_start = (
+                (batch_index // accumulation) * accumulation
+            )
+            group_size = min(
+                accumulation, total_batches - group_start
             )
 
-            loss.backward()
-
+            (raw_loss / group_size).backward()
             accum_count += 1
 
-            is_last_batch = (
-                batch_index == total_batches
-            )
+            is_last_batch = batch_index + 1 == total_batches
 
-            should_step = (
-                accum_count
-                == config["grad_accumulation_factor"]
-            ) or is_last_batch
-
-            if should_step:
+            if accum_count == group_size or is_last_batch:
                 model_optimizer.step()
 
                 if encoder_optimizer is not None:
@@ -799,15 +911,29 @@ def main():
                 optimizer_steps += 1
                 accum_count = 0
 
-        average_train_loss = (
-            running_loss / max(1, batch_count)
-        )
+                if (
+                    optimizer_steps % checkpoint_interval == 0
+                    and not is_last_batch
+                ):
+                    save_training_state(
+                        next_epoch=epoch,
+                        next_batch=batch_index + 1,
+                        running_loss=running_loss,
+                        batch_count=batch_count,
+                        unk_count=unk_counter[0],
+                    )
+                    print(
+                        f"Checkpoint saved at optimizer step "
+                        f"{optimizer_steps}",
+                        flush=True,
+                    )
+
+        average_train_loss = running_loss / max(1, batch_count)
 
         if unk_counter[0] > 0:
             print(
-                f"Warning: {unk_counter[0]} characters were mapped to "
-                f"<unk> during this epoch (out-of-vocabulary for the "
-                f"training set)."
+                f"Unknown character substitutions: "
+                f"{unk_counter[0]}"
             )
 
         validation_metrics = evaluate_model(
@@ -829,30 +955,33 @@ def main():
         metrics_history.append(epoch_metrics)
 
         with open(
-            output_dir / "metrics.json",
-            "w",
-            encoding="utf-8",
+            output_dir / "metrics.json", "w", encoding="utf-8"
         ) as f:
-            json.dump(
-                metrics_history,
-                f,
-                indent=2,
-            )
+            json.dump(metrics_history, f, indent=2)
 
         print(
             f"Epoch {epoch + 1}/{config['number_of_epochs']} "
             f"- train_loss: {average_train_loss:.4f} "
             f"- eval_loss: {validation_metrics['eval_loss']:.4f} "
             f"- WER: {validation_metrics['wer']:.4f} "
-            f"- CER: {validation_metrics['cer']:.4f}"
+            f"- CER: {validation_metrics['cer']:.4f}",
+            flush=True,
         )
 
-        if validation_metrics["wer"] < best_wer:
-            best_wer = validation_metrics["wer"]
+        current_metric = validation_metrics[best_metric]
 
-            torch.save(
-                model.state_dict(),
+        improved = (
+            current_metric < best_wer
+            if best_mode == "min"
+            else current_metric > best_wer
+        )
+
+        if save_best_model and improved:
+            best_wer = current_metric
+
+            save_checkpoint(
                 output_dir / "best_model.pt",
+                model.state_dict(),
             )
 
             with open(
@@ -860,16 +989,29 @@ def main():
                 "w",
                 encoding="utf-8",
             ) as f:
-                json.dump(
-                    epoch_metrics,
-                    f,
-                    indent=2,
-                )
+                json.dump(epoch_metrics, f, indent=2)
 
             print(
-                f"New best model saved "
-                f"(WER: {best_wer:.4f})"
+                f"New best model saved ({best_metric}: {best_wer:.4f})",
+                flush=True,
             )
+
+        # The next epoch starts at batch zero.
+        if save_each_epoch or resume_enabled:
+            save_training_state(
+                next_epoch=epoch + 1,
+                next_batch=0,
+                running_loss=0.0,
+                batch_count=0,
+                unk_count=0,
+            )
+
+            print(
+                f"Epoch checkpoint saved: {checkpoint_file}",
+                flush=True,
+            )
+
+        start_batch = 0
 
     if config.get("track_compute", True):
         compute_results = compute_tracker.stop()
@@ -887,11 +1029,30 @@ def main():
             )
         )
 
+    # Use the best validation checkpoint as the final model.
+    best_checkpoint = output_dir / "best_model.pt"
+
+    if not best_checkpoint.is_file():
+        raise RuntimeError(
+            "No best checkpoint was saved during training."
+        )
+
+    best_state_dict = torch.load(
+        best_checkpoint,
+        map_location=device,
+        weights_only=True,
+    )
+
+    model.load_state_dict(best_state_dict)
+
     torch.save(
         model.state_dict(),
         output_dir / "model.pt",
     )
 
+    print(f"Best validation {best_metric}: {best_wer:.4f}")
+    print(f"Best checkpoint: {best_checkpoint}")
+    print(f"Final model: {output_dir / 'model.pt'}")
     print(f"Optimizer steps: {optimizer_steps}")
     print("Training complete.")
 
