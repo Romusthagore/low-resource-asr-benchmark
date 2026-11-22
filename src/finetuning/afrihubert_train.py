@@ -94,6 +94,33 @@ def parse_args():
         help="Path to YAML configuration file.",
     )
 
+    parser.add_argument(
+        "--dataset-name",
+        default=None,
+        help=(
+            "Dataset id (local path or Hugging Face Hub repo), "
+            "overriding 'dataset_name' from the config file."
+        ),
+    )
+
+    parser.add_argument(
+        "--model-name",
+        default=None,
+        help=(
+            "AfriHuBERT model id (local path or Hugging Face Hub repo), "
+            "overriding 'model_name' from the config file."
+        ),
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=(
+            "Directory for checkpoints and metrics, overriding "
+            "'output_dir' from the config file."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -486,6 +513,15 @@ def evaluate_model(
 def main():
     args = parse_args()
     config = load_config(args.config)
+
+    if args.dataset_name is not None:
+        config["dataset_name"] = args.dataset_name
+
+    if args.model_name is not None:
+        config["model_name"] = args.model_name
+
+    if args.output_dir is not None:
+        config["output_dir"] = args.output_dir
 
     set_seed(config["seed"])
 
