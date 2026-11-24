@@ -1,11 +1,10 @@
-dataset_name: /home/r/romus/links/scratch/data/DDD-Kenya-Fleurs/Luhya
 dataset_config: null
 train_split: train
 eval_split: null
 text_column: transcripts
 audio_column: audio
-sample: true
-target_train_hours: 50
+sample: false
+target_train_hours: null
 sample_size: null
 validation_split_pct: 0.1
 seed: 42
@@ -29,15 +28,14 @@ encoder_learning_rate: 0.0001
 precision: fp32
 num_workers: 2
 track_compute: true
-output_dir: /home/r/romus/links/scratch/low-resource-asr-benchmark/outputs/afrihubert-luhya_642h_50h_seed42
 test_split: null
 test_split_pct: 0.1
-max_eval_samples: 1000
-
-# Checkpointing
+max_eval_samples: null
 checkpoint_steps: 100
 save_each_epoch: true
 resume_from_checkpoint: true
 save_best_model: true
 best_model_metric: wer
 best_model_mode: min
+initial_checkpoint: null
+max_train_samples: null

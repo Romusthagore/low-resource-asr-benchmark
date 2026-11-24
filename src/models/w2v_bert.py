@@ -30,8 +30,39 @@ def load_w2v_bert(
 
     model = Wav2Vec2BertModel.from_pretrained(
         model_name,
-        torch_dtype=dtype,
+        dtype=dtype,
     )
+    model.to(device)
+
+    return model, device
+
+
+from transformers import Wav2Vec2BertForCTC
+
+
+def load_w2v_bert_ctc(
+    model_name=DEFAULT_W2V_BERT_MODEL,
+    vocab_size=None,
+    blank_token_id=0,
+    device=None,
+):
+    """Load Wav2Vec2-BERT 2.0 with a CTC classification head."""
+
+    if vocab_size is None:
+        raise ValueError("vocab_size must be specified")
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = Wav2Vec2BertForCTC.from_pretrained(
+        model_name,
+        vocab_size=vocab_size,
+        pad_token_id=blank_token_id,
+        ctc_loss_reduction="mean",
+        ctc_zero_infinity=True,
+        dtype=torch.float32,
+    )
+
     model.to(device)
 
     return model, device
