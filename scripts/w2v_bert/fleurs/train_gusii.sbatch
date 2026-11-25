@@ -14,6 +14,7 @@ set -euo pipefail
 cd ~/low-resource-asr-benchmark
 
 source /home/mila/a/ahomagnr/venvs/asr-benchmark-clean/bin/activate
+export LD_LIBRARY_PATH="/cvmfs/ai.mila.quebec/apps/x86_64/debian/anaconda/3/lib:${LD_LIBRARY_PATH:-}"
 
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
@@ -25,6 +26,7 @@ export HF_HUB_CACHE=$HF_HOME/hub
 export TMPDIR=/network/scratch/a/ahomagnr/tmp
 
 mkdir -p "$HF_DATASETS_CACHE" "$HF_HUB_CACHE" "$TMPDIR"
+trap 'rm -rf "$HF_DATASETS_CACHE"' EXIT
 
 DATASET="/network/scratch/a/ahomagnr/DDD/DDD-Kenya-Fleurs/Gusii"
 

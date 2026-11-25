@@ -12,11 +12,13 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import yaml
 from safetensors.torch import save_file, load_file
 from datasets import Audio, load_dataset, load_from_disk
 from jiwer import cer, wer
 from transformers import (
+    EarlyStoppingCallback,
     AutoProcessor,
     Trainer,
     TrainingArguments,
@@ -253,6 +255,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--dataset-config", default=None)
     args = parser.parse_args()
 
     with open(args.config, encoding="utf-8") as f:
@@ -271,15 +274,38 @@ def main():
 
     dataset_name = cfg["dataset_name"]
     dataset_config = cfg.get("dataset_config")
+    if args.dataset_config is not None:
+        dataset_config = args.dataset_config
     audio_column = cfg.get("audio_column", "audio")
     text_column = cfg.get("text_column", "transcripts")
 
-    train_ds = load_split(
-        dataset_name, cfg.get("train_split", "train"), dataset_config
-    )
-    valid_ds = load_split(
-        dataset_name, cfg.get("eval_split", "validation"), dataset_config
-    )
+    if distributed and not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    if distributed:
+        if rank == 0:
+            train_ds = load_split(
+                dataset_name, cfg.get("train_split", "train"), dataset_config
+            )
+            valid_ds = load_split(
+                dataset_name, cfg.get("eval_split", "validation"), dataset_config
+            )
+            dist.barrier()
+        else:
+            dist.barrier()
+            train_ds = load_split(
+                dataset_name, cfg.get("train_split", "train"), dataset_config
+            )
+            valid_ds = load_split(
+                dataset_name, cfg.get("eval_split", "validation"), dataset_config
+            )
+    else:
+        train_ds = load_split(
+            dataset_name, cfg.get("train_split", "train"), dataset_config
+        )
+        valid_ds = load_split(
+            dataset_name, cfg.get("eval_split", "validation"), dataset_config
+        )
 
     train_ds = train_ds.cast_column(
         audio_column, Audio(sampling_rate=16000)
@@ -306,7 +332,6 @@ def main():
         )
 
     if distributed:
-        import torch.distributed as dist
         # torchrun sets RANK/WORLD_SIZE, but Trainer has not
         # necessarily initialized the process group yet.
         if not dist.is_initialized():
@@ -333,21 +358,24 @@ def main():
 
         if duration > max_audio_length:
             row["keep"] = False
-            row["input_values"] = []
+            row["input_values"] = np.zeros(0, dtype=np.float32)
             row["labels"] = []
             return row
 
         text = normalize(row[text_column])
         if not text:
             row["keep"] = False
-            row["input_values"] = []
+            row["input_values"] = np.zeros(0, dtype=np.float32)
             row["labels"] = []
             return row
 
-        row["input_values"] = processor(
-            audio["array"],
-            sampling_rate=audio["sampling_rate"],
-        ).input_values[0]
+        row["input_values"] = np.asarray(
+            processor(
+                audio["array"],
+                sampling_rate=audio["sampling_rate"],
+            ).input_values[0],
+            dtype=np.float32,
+        )
 
         row["labels"] = processor.tokenizer(text).input_ids
         row["keep"] = True
@@ -419,6 +447,7 @@ def main():
         fp16=cfg.get("fp16", True),
         bf16=cfg.get("bf16", False),
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         eval_strategy="steps",
         save_strategy="steps",
         eval_steps=eval_steps,
@@ -432,7 +461,7 @@ def main():
         report_to="none",
         seed=seed,
         data_seed=seed,
-        ddp_find_unused_parameters=False,
+        ddp_find_unused_parameters=True,
         save_safetensors=True,
     )
 
@@ -444,6 +473,12 @@ def main():
         data_collator=CTCDataCollator(processor),
         compute_metrics=compute_metrics,
         processing_class=processor,
+        callbacks=[
+            EarlyStoppingCallback(
+                early_stopping_patience=5,
+                early_stopping_threshold=0.001,
+            )
+        ],
     )
 
     trainer.train(

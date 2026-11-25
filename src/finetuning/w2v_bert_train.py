@@ -1,173 +1,141 @@
-"""Wav2Vec2-BERT CTC fine-tuning using the shared HF Trainer."""
-
-from __future__ import annotations
+"""Wav2Vec2-BERT 2.0 CTC fine-tuning with DDP."""
 
 import argparse
 import json
+import random
+from contextlib import nullcontext
 from pathlib import Path
 
+import numpy as np
 import torch
+import torch.distributed as dist
 import yaml
 
-from transformers import (
-    SeamlessM4TFeatureExtractor,
-    Wav2Vec2BertProcessor,
-    Wav2Vec2CTCTokenizer,
-)
+from transformers import SeamlessM4TFeatureExtractor
 
-from src.data.loaders import load_dataset_with_splits
-from src.data.preprocessing import (
-    normalize_transcription,
-    prepare_ctc_dataset,
-)
-from src.data.collator import DataCollatorCTCWithPadding
 from src.models.w2v_bert import load_w2v_bert_ctc
-from src.training.trainer import (
-    set_seed,
-    create_ctc_trainer,
-    train_ctc_model,
+from src.finetuning.afrihubert_train import (
+    load_train_eval_splits,
+    prepare_examples,
+    build_character_vocabulary,
+    encode_text,
+)
+from src.evaluation.metrics import (
+    compute_asr_metrics,
+    decode_ctc_predictions,
+)
+from src.utils.distributed import (
+    setup_distributed,
+    wrap_model,
+    unwrap_model,
+    is_main_process,
+    barrier,
+    cleanup_distributed,
+    distributed_epoch_indices,
+    gather_rank_states,
+)
+from src.utils.training_checkpoint import (
+    capture_rng_state,
+    restore_rng_state,
+    save_checkpoint,
+    load_checkpoint,
 )
 
 
-DEFAULT_CONFIG = "configs/w2v_bert.yaml"
+def collate_batch(batch, vocabulary, extractor, device):
+    audio = [ex["audio"] for ex in batch]
 
+    rates = {ex["sampling_rate"] for ex in batch}
+    if rates != {16000}:
+        raise ValueError(f"Expected 16 kHz audio, got {rates}")
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=DEFAULT_CONFIG)
-    parser.add_argument("--dataset-name", default=None)
-    parser.add_argument("--output-dir", default=None)
-    parser.add_argument(
-        "--resume-from-checkpoint",
-        default=None,
-        help="Explicit Hugging Face Trainer checkpoint path.",
+    features = extractor(
+        audio,
+        sampling_rate=16000,
+        padding=True,
+        return_attention_mask=True,
+        return_tensors="pt",
     )
-    return parser.parse_args()
 
+    if features["input_features"].shape[-1] != 160:
+        raise RuntimeError("Expected 160 acoustic features")
 
-def load_config(path):
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    labels = [
+        encode_text(ex["sentence"], vocabulary)
+        for ex in batch
+    ]
 
+    max_length = max(map(len, labels))
+    padded_labels = torch.full(
+        (len(labels), max_length),
+        -100,
+        dtype=torch.long,
+    )
 
-def build_vocabulary(dataset, text_column, lowercase=True):
-    """Build the CTC vocabulary using training transcripts only."""
-
-    characters = set()
-
-    for text in dataset[text_column]:
-        cleaned = normalize_transcription(
-            text,
-            lowercase=lowercase,
-            strip_diacritics=False,
+    for i, tokens in enumerate(labels):
+        padded_labels[i, :len(tokens)] = torch.tensor(
+            tokens, dtype=torch.long
         )
-        characters.update(cleaned)
 
-    # Hugging Face CTC tokenizer uses | for word boundaries.
-    characters.discard(" ")
-    characters.discard("|")
-
-    vocabulary = {
-        "[PAD]": 0,
-        "[UNK]": 1,
-        "|": 2,
+    return {
+        "input_features": features["input_features"].to(device),
+        "attention_mask": features["attention_mask"].to(device),
+        "labels": padded_labels.to(device),
     }
 
-    for char in sorted(characters):
-        if char not in vocabulary:
-            vocabulary[char] = len(vocabulary)
 
-    return vocabulary
+@torch.no_grad()
+def evaluate(model, examples, vocabulary, extractor, batch_size, device):
+    model.eval()
 
+    id_to_token = {v: k for k, v in vocabulary.items()}
+    predictions = []
+    references = []
+    losses = []
 
-def create_processor(model_name, vocabulary, output_dir):
-    """Create the Wav2Vec2-BERT feature extractor and CTC tokenizer."""
+    for start in range(0, len(examples), batch_size):
+        batch = examples[start:start + batch_size]
+        inputs = collate_batch(batch, vocabulary, extractor, device)
 
-    tokenizer_dir = output_dir / "tokenizer"
-    tokenizer_dir.mkdir(parents=True, exist_ok=True)
+        outputs = model(**inputs)
 
-    vocab_file = tokenizer_dir / "vocab.json"
+        if not torch.isfinite(outputs.loss):
+            raise RuntimeError("Non-finite validation CTC loss")
 
-    with open(vocab_file, "w", encoding="utf-8") as f:
-        json.dump(
-            vocabulary,
-            f,
-            ensure_ascii=False,
-            indent=2,
+        lengths = model._get_feat_extract_output_lengths(
+            inputs["attention_mask"].sum(dim=-1)
+        ).long()
+
+        if (lengths > outputs.logits.shape[1]).any():
+            raise RuntimeError("Invalid CTC output lengths")
+
+        decoded = decode_ctc_predictions(
+            outputs.logits,
+            lengths,
+            id_to_token,
         )
 
-    tokenizer = Wav2Vec2CTCTokenizer(
-        str(vocab_file),
-        unk_token="[UNK]",
-        pad_token="[PAD]",
-        word_delimiter_token="|",
-        do_lower_case=False,
-    )
+        predictions.extend(decoded)
+        references.extend(ex["sentence"] for ex in batch)
+        losses.append(outputs.loss.item())
 
-    extractor = SeamlessM4TFeatureExtractor.from_pretrained(
-        model_name
-    )
-
-    processor = Wav2Vec2BertProcessor(
-        feature_extractor=extractor,
-        tokenizer=tokenizer,
-    )
-
-    processor.save_pretrained(str(output_dir / "processor"))
-
-    return processor
-
-
-def build_optimizer(model, config):
-    """Keep distinct learning rates for encoder and CTC head."""
-
-    encoder_parameters = []
-    head_parameters = []
-
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-
-        if name.startswith("wav2vec2_bert."):
-            encoder_parameters.append(parameter)
-        else:
-            head_parameters.append(parameter)
-
-    parameter_groups = []
-
-    if encoder_parameters:
-        parameter_groups.append(
-            {
-                "params": encoder_parameters,
-                "lr": float(config["encoder_learning_rate"]),
-            }
-        )
-
-    if head_parameters:
-        parameter_groups.append(
-            {
-                "params": head_parameters,
-                "lr": float(config["learning_rate"]),
-            }
-        )
-
-    if not parameter_groups:
-        raise RuntimeError("No trainable parameters found.")
-
-    return torch.optim.AdamW(
-        parameter_groups,
-        betas=(
-            float(config.get("adam_beta1", 0.9)),
-            float(config.get("adam_beta2", 0.98)),
-        ),
-        eps=float(config.get("adam_epsilon", 1e-8)),
-        weight_decay=float(config.get("weight_decay", 0.0)),
-    )
+    metrics = compute_asr_metrics(references, predictions)
+    metrics["eval_loss"] = sum(losses) / max(1, len(losses))
+    return metrics
 
 
 def main():
-    args = parse_args()
-    config = load_config(args.config)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        default="configs/ddp/w2v_bert_gusii_2gpu.yaml",
+    )
+    parser.add_argument("--dataset-name", default=None)
+    parser.add_argument("--output-dir", default=None)
+    args = parser.parse_args()
+
+    with open(args.config, encoding="utf-8") as f:
+        config = yaml.safe_load(f)
 
     if args.dataset_name is not None:
         config["dataset_name"] = args.dataset_name
@@ -175,204 +143,401 @@ def main():
     if args.output_dir is not None:
         config["output_dir"] = args.output_dir
 
-    set_seed(int(config.get("seed", 42)))
+    context = setup_distributed()
+    rank = context["rank"]
+    world_size = context["world_size"]
+    distributed = context["distributed"]
+    device = context["device"]
 
-    output_dir = Path(config["output_dir"]).expanduser()
+    seed = int(config["seed"])
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    # Never overwrite a previous custom-DDP experiment.
-    legacy_dir = Path(
-        "/network/scratch/a/ahomagnr/"
-        "low-resource-asr-benchmark/outputs/"
-        "w2v-bert-gusii-ddp-2gpu"
-    )
-
-    if output_dir.resolve() == legacy_dir.resolve():
-        raise RuntimeError(
-            "Refusing to overwrite legacy custom-DDP checkpoints."
-        )
-
+    output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    config["output_dir"] = str(output_dir)
 
-    # This pipeline always selects the lowest validation WER.
-    config["best_model_metric"] = "wer"
-    config["best_model_mode"] = "min"
-
-    # Use official validation split only.
-    dataset = load_dataset_with_splits(
-        config["dataset_name"],
-        audio_column=config.get("audio_column", "audio"),
-        sampling_rate=16000,
-    )
-
-    if "train" not in dataset:
-        raise RuntimeError("Official train split is missing.")
-
-    if "validation" not in dataset:
-        raise RuntimeError(
-            "Official validation/dev split is missing. "
-            "No automatic split will be created."
-        )
-
-    train_dataset = dataset["train"]
-    eval_dataset = dataset["validation"]
+    if is_main_process(context):
+        train_split, eval_split = load_train_eval_splits(config)
+        barrier(context)
+    else:
+        barrier(context)
+        train_split, eval_split = load_train_eval_splits(config)
 
     if config.get("max_train_samples") is not None:
-        n = min(
-            int(config["max_train_samples"]),
-            len(train_dataset),
-        )
-        train_dataset = train_dataset.select(range(n))
+        n = min(int(config["max_train_samples"]), len(train_split))
+        train_split = train_split.select(range(n))
 
     if config.get("max_eval_samples") is not None:
-        n = min(
-            int(config["max_eval_samples"]),
-            len(eval_dataset),
+        n = min(int(config["max_eval_samples"]), len(eval_split))
+        eval_split = eval_split.select(range(n))
+
+    train_examples = prepare_examples(
+        train_split,
+        config["max_audio_length"],
+        config["text_column"],
+    )
+    eval_examples = prepare_examples(
+        eval_split,
+        config["max_audio_length"],
+        config["text_column"],
+    )
+
+    if not train_examples or not eval_examples:
+        raise RuntimeError("Empty train or validation dataset")
+
+    vocabulary = build_character_vocabulary(train_examples)
+
+    if is_main_process(context):
+        print(
+            f"Train={len(train_examples)}, "
+            f"Eval={len(eval_examples)}, "
+            f"Vocab={len(vocabulary)}",
+            flush=True,
         )
-        eval_dataset = eval_dataset.select(range(n))
-
-    text_column = config.get("text_column", "transcripts")
-    audio_column = config.get("audio_column", "audio")
-
-    vocabulary = build_vocabulary(
-        train_dataset,
-        text_column=text_column,
-    )
-
-    blank_id = int(config.get("blank_index", 0))
-
-    if vocabulary["[PAD]"] != blank_id:
-        raise ValueError(
-            "CTC blank index must match tokenizer pad_token_id."
+        (output_dir / "vocabulary.json").write_text(
+            json.dumps(vocabulary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (output_dir / "config.yaml").write_text(
+            yaml.safe_dump(config),
+            encoding="utf-8",
         )
 
-    processor = create_processor(
-        config["model_name"],
-        vocabulary,
-        output_dir,
-    )
+    barrier(context)
 
-    train_encoded = prepare_ctc_dataset(
-        train_dataset,
-        processor,
-        text_column=text_column,
-        audio_column=audio_column,
-        max_audio_length=config.get("max_audio_length", 30.0),
-        lowercase=True,
-        strip_diacritics=False,
-        desc="Encode Wav2Vec2-BERT train",
-    )
-
-    eval_encoded = prepare_ctc_dataset(
-        eval_dataset,
-        processor,
-        text_column=text_column,
-        audio_column=audio_column,
-        max_audio_length=config.get("max_audio_length", 30.0),
-        lowercase=True,
-        strip_diacritics=False,
-        desc="Encode Wav2Vec2-BERT validation",
-    )
-
-    if len(train_encoded) == 0 or len(eval_encoded) == 0:
-        raise RuntimeError("Empty train or validation dataset.")
-
-    print(
-        f"Train={len(train_encoded)} "
-        f"Validation={len(eval_encoded)} "
-        f"Vocab={len(vocabulary)}",
-        flush=True,
+    extractor = SeamlessM4TFeatureExtractor.from_pretrained(
+        config["model_name"]
     )
 
     model, _ = load_w2v_bert_ctc(
         model_name=config["model_name"],
-        vocab_size=len(processor.tokenizer),
-        blank_token_id=processor.tokenizer.pad_token_id,
-        device="cpu",
+        vocab_size=len(vocabulary),
+        blank_token_id=config["blank_index"],
+        device=device,
     )
 
     if config.get("freeze_wav2vec", False):
         for parameter in model.wav2vec2_bert.parameters():
             parameter.requires_grad = False
 
-    collator = DataCollatorCTCWithPadding(
-        processor=processor,
-        padding=True,
+    encoder_parameters = []
+    head_parameters = []
+
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("wav2vec2_bert."):
+            encoder_parameters.append(parameter)
+        else:
+            head_parameters.append(parameter)
+
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": encoder_parameters,
+                "lr": float(config["encoder_learning_rate"]),
+            },
+            {
+                "params": head_parameters,
+                "lr": float(config["learning_rate"]),
+            },
+        ]
     )
 
-    # Pilot: validate actual features and finite CTC loss.
-    pilot_batch = collator([train_encoded[0]])
+    checkpoint_file = output_dir / "last_checkpoint.pt"
+    best_file = output_dir / "best_model.pt"
 
-    model.eval()
+    start_epoch = 0
+    start_batch = 0
+    optimizer_steps = 0
+    best_wer = float("inf")
+    history = []
+    saved_rng = None
+    running_loss_resume = 0.0
+    batch_count_resume = 0
 
-    with torch.no_grad():
-        pilot_output = model(**pilot_batch)
+    if config.get("resume_from_checkpoint", True) and checkpoint_file.exists():
+        checkpoint = load_checkpoint(
+            checkpoint_file, map_location="cpu"
+        )
 
-    if (
-        pilot_output.loss is None
-        or not torch.isfinite(pilot_output.loss)
-    ):
-        raise RuntimeError("Pilot CTC loss is not finite.")
+        if checkpoint["world_size"] != world_size:
+            raise RuntimeError("Checkpoint world size mismatch")
+        if checkpoint["vocabulary"] != vocabulary:
+            raise RuntimeError("Checkpoint vocabulary mismatch")
 
-    print(
-        "Pilot CTC OK:",
-        tuple(pilot_batch["input_features"].shape),
-        "loss:",
-        float(pilot_output.loss),
-        flush=True,
-    )
+        for key in (
+            "dataset_name",
+            "model_name",
+            "seed",
+            "batch_size",
+            "grad_accumulation_factor",
+        ):
+            if checkpoint["config"][key] != config[key]:
+                raise RuntimeError(f"Checkpoint config mismatch: {key}")
 
-    model.train()
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
 
-    trainer = create_ctc_trainer(
-        model=model,
-        processor=processor,
-        train_dataset=train_encoded,
-        eval_dataset=eval_encoded,
-        data_collator=collator,
-        config=config,
-        output_dir=str(output_dir),
-    )
+        start_epoch = checkpoint["next_epoch"]
+        start_batch = checkpoint["next_batch"]
+        optimizer_steps = checkpoint["optimizer_steps"]
+        best_wer = checkpoint["best_wer"]
+        history = checkpoint["history"]
+        saved_rng = checkpoint["rank_rng_states"][rank]
 
-    # Override the default Trainer optimizer to retain
-    # separate encoder/head learning rates.
-    trainer.optimizer = build_optimizer(
-        trainer.model,
-        config,
-    )
+        counters = checkpoint["rank_counters"][rank]
+        running_loss_resume = counters["running_loss"]
+        batch_count_resume = counters["batch_count"]
 
-    results = train_ctc_model(
-        trainer,
-        resume_from_checkpoint=args.resume_from_checkpoint,
-        evaluate_after_training=True,
-    )
+        if best_wer < float("inf") and not best_file.exists():
+            raise RuntimeError("Best checkpoint missing")
 
-    if trainer.is_world_process_zero():
-        with open(
-            output_dir / "config.yaml",
-            "w",
-            encoding="utf-8",
-        ) as f:
-            yaml.safe_dump(
-                config,
-                f,
-                allow_unicode=True,
+        if is_main_process(context):
+            print(
+                f"Resuming epoch={start_epoch + 1}, "
+                f"batch={start_batch + 1}",
+                flush=True,
             )
 
-        summary = {
-            "best_checkpoint": results["best_checkpoint"],
-            "best_validation_wer": results["best_validation_wer"],
-            "validation_metrics": results["validation_metrics"],
-        }
+    # Pilot: check real acoustic features and CTC loss.
+    pilot = collate_batch(
+        train_examples[:1], vocabulary, extractor, device
+    )
 
-        with open(
-            output_dir / "summary.json",
-            "w",
-            encoding="utf-8",
-        ) as f:
-            json.dump(summary, f, indent=2)
+    model.eval()
+    with torch.no_grad():
+        pilot_output = model(**pilot)
 
-        print(json.dumps(summary, indent=2), flush=True)
+    if not torch.isfinite(pilot_output.loss):
+        raise RuntimeError("Pilot CTC loss is not finite")
+
+    if is_main_process(context):
+        print(
+            f"Pilot CTC OK: "
+            f"features={tuple(pilot['input_features'].shape)}, "
+            f"logits={tuple(pilot_output.logits.shape)}, "
+            f"loss={pilot_output.loss.item():.4f}",
+            flush=True,
+        )
+
+    del pilot, pilot_output
+
+    model = wrap_model(model, context)
+
+    if saved_rng is not None:
+        restore_rng_state(saved_rng)
+
+    def save_state(next_epoch, next_batch, running_loss, batch_count):
+        rng_states = gather_rank_states(
+            capture_rng_state(), context
+        )
+        counters = gather_rank_states(
+            {
+                "running_loss": running_loss,
+                "batch_count": batch_count,
+            },
+            context,
+        )
+
+        if is_main_process(context):
+            save_checkpoint(
+                checkpoint_file,
+                {
+                    "version": 1,
+                    "world_size": world_size,
+                    "model": unwrap_model(model).state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "next_epoch": next_epoch,
+                    "next_batch": next_batch,
+                    "optimizer_steps": optimizer_steps,
+                    "best_wer": best_wer,
+                    "history": history,
+                    "vocabulary": vocabulary,
+                    "config": config,
+                    "rank_rng_states": rng_states,
+                    "rank_counters": counters,
+                },
+            )
+
+    accumulation = int(config["grad_accumulation_factor"])
+    batch_size = int(config["batch_size"])
+    checkpoint_steps = int(config["checkpoint_steps"])
+
+    for epoch in range(start_epoch, int(config["number_of_epochs"])):
+        model.train()
+
+        indices = distributed_epoch_indices(
+            dataset_size=len(train_examples),
+            epoch=epoch,
+            seed=seed,
+            rank=rank,
+            world_size=world_size,
+        )
+        epoch_examples = [train_examples[i] for i in indices]
+        total_batches = (len(epoch_examples) + batch_size - 1) // batch_size
+
+        first_batch = start_batch if epoch == start_epoch else 0
+        running_loss = (
+            running_loss_resume if epoch == start_epoch else 0.0
+        )
+        batch_count = (
+            batch_count_resume if epoch == start_epoch else 0
+        )
+
+        optimizer.zero_grad()
+
+        for batch_index in range(first_batch, total_batches):
+            start = batch_index * batch_size
+            batch = epoch_examples[start:start + batch_size]
+
+            inputs = collate_batch(
+                batch, vocabulary, extractor, device
+            )
+
+            group_start = (batch_index // accumulation) * accumulation
+            group_size = min(
+                accumulation, total_batches - group_start
+            )
+            should_step = (
+                batch_index - group_start + 1 == group_size
+            )
+
+            sync_context = (
+                model.no_sync()
+                if distributed and not should_step
+                else nullcontext()
+            )
+
+            with sync_context:
+                outputs = model(**inputs)
+                loss = outputs.loss
+
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        f"Non-finite CTC loss at epoch={epoch}, "
+                        f"batch={batch_index}"
+                    )
+
+                (loss / group_size).backward()
+
+            running_loss += loss.item()
+            batch_count += 1
+
+            if should_step:
+                optimizer.step()
+                optimizer.zero_grad()
+                optimizer_steps += 1
+
+                if (
+                    optimizer_steps % checkpoint_steps == 0
+                    and batch_index + 1 < total_batches
+                ):
+                    save_state(
+                        epoch,
+                        batch_index + 1,
+                        running_loss,
+                        batch_count,
+                    )
+                    barrier(context)
+
+            if (
+                is_main_process(context)
+                and (batch_index == first_batch or
+                     (batch_index + 1) % 50 == 0)
+            ):
+                print(
+                    f"Epoch {epoch + 1} "
+                    f"batch {batch_index + 1}/{total_batches} "
+                    f"loss={loss.item():.4f}",
+                    flush=True,
+                )
+
+        stats = torch.tensor(
+            [running_loss, float(batch_count)],
+            dtype=torch.float64,
+            device=device,
+        )
+        if distributed:
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+        if is_main_process(context):
+            metrics = evaluate(
+                unwrap_model(model),
+                eval_examples,
+                vocabulary,
+                extractor,
+                int(config["test_batch_size"]),
+                device,
+            )
+
+            metrics["epoch"] = epoch + 1
+            metrics["train_loss"] = (
+                stats[0].item() / max(1, stats[1].item())
+            )
+            history.append(metrics)
+
+            (output_dir / "metrics.json").write_text(
+                json.dumps(history, indent=2),
+                encoding="utf-8",
+            )
+
+            print(
+                f"Epoch {epoch + 1}: "
+                f"train_loss={metrics['train_loss']:.4f}, "
+                f"eval_loss={metrics['eval_loss']:.4f}, "
+                f"WER={metrics['wer']:.4f}, "
+                f"CER={metrics['cer']:.4f}",
+                flush=True,
+            )
+
+            if metrics["wer"] < best_wer:
+                best_wer = metrics["wer"]
+                save_checkpoint(
+                    best_file,
+                    unwrap_model(model).state_dict(),
+                )
+                (output_dir / "best_metrics.json").write_text(
+                    json.dumps(metrics, indent=2),
+                    encoding="utf-8",
+                )
+                print("New best checkpoint saved", flush=True)
+
+        if distributed:
+            best_tensor = torch.tensor(
+                [best_wer], dtype=torch.float64, device=device
+            )
+            dist.broadcast(best_tensor, src=0)
+            best_wer = best_tensor.item()
+
+        barrier(context)
+        save_state(epoch + 1, 0, 0.0, 0)
+        barrier(context)
+        start_batch = 0
+
+    if is_main_process(context):
+        if not best_file.exists():
+            raise RuntimeError("No best checkpoint found")
+
+        best_state = torch.load(
+            best_file, map_location=device, weights_only=True
+        )
+        unwrap_model(model).load_state_dict(best_state)
+
+        save_checkpoint(
+            output_dir / "model.pt",
+            unwrap_model(model).state_dict(),
+        )
+        print(
+            f"Training complete. Best WER={best_wer:.4f}",
+            flush=True,
+        )
+
+    barrier(context)
+    cleanup_distributed(context)
 
 
 if __name__ == "__main__":

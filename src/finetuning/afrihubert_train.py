@@ -530,7 +530,12 @@ def main():
     print(f"Seed: {config['seed']}")
     print(f"Model: {config['model_name']}")
 
-    train_split, eval_split = load_train_eval_splits(config)
+    if is_main_process(context):
+        train_split, eval_split = load_train_eval_splits(config)
+        barrier(context)
+    else:
+        barrier(context)
+        train_split, eval_split = load_train_eval_splits(config)
 
     text_column = config.get("text_column", "sentence")
 
